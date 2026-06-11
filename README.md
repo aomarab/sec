@@ -83,6 +83,22 @@ The web UI is organised into tabs: **Generate** (on-demand briefing), **Analyze
 file**, **Schedule** (recurring emailed briefings), **History** (view / download
 HTML, PDF, Markdown / preview / delete), **Dashboard**, and **Settings**.
 
+### Login & user management
+
+The web app requires sign-in. On first run an admin account is created from
+`ADMIN_USER` / `ADMIN_PASSWORD` in `.env` (default `admin` / `admin` — **change
+it after first login** via Settings → Change my password). Passwords are stored
+salted+hashed (never plaintext) in `users.json`.
+
+Admins get an **Admin** tab to create users and grant per-feature privileges:
+**Generate briefings**, **Analyze files**, **Manage email schedule**, **Delete
+history**, and **Administer users**. Tabs and actions are shown/enforced per the
+signed-in user's privileges. The last administrator cannot be deleted or demoted.
+
+> Self-hosted/internal use. Don't expose to the public internet without TLS and
+> a hardened deployment. To persist logins across container rebuilds, mount
+> `users.json` and `.flask_secret` as volumes.
+
 ### Analyze a threat document (upload)
 
 On the **Analyze file** tab, upload a PDF or Excel/CSV threat report (e.g. a CISA

@@ -17,10 +17,11 @@ import uuid
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from flask import (Flask, abort, jsonify, render_template_string, request,
-                   send_file)
+from flask import (Flask, abort, jsonify, redirect, render_template_string,
+                   request, send_file, session)
 from werkzeug.utils import secure_filename
 
+import auth
 from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
 from analysis.extract import SUPPORTED as ALLOWED_EXT
@@ -32,13 +33,28 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("webapp")
 
 app = Flask(__name__)
+app.secret_key = auth.get_secret_key()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 
 SCHEDULE_FILE = os.getenv("SCHEDULE_FILE", "schedule.json")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "uploads")
+BRANDING_DIR = os.getenv("BRANDING_DIR", "branding")
+LOGO_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
 _SCHED = BackgroundScheduler(timezone="UTC")
 _JOB_ID = "email_briefing"
+
+
+def _logo_path():
+    for p in sorted(glob.glob(os.path.join(BRANDING_DIR, "logo.*"))):
+        return p
+    return None
+
+
+def _logo_ver():
+    p = _logo_path()
+    return int(os.path.getmtime(p)) if p else 0
 
 SEVERITY_CHOICES = [(9.0, "Critical only"), (7.0, "High and Critical"),
                     (4.0, "Medium and above"), (0.0, "All severities")]
@@ -222,18 +238,133 @@ def _next_run():
 
 
 # ── routes ──────────────────────────────────────────────────────────────────
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    nxt = request.args.get("next", "/")
+    logo, ver = bool(_logo_path()), _logo_ver()
+    if request.method == "POST":
+        if auth.verify(request.form.get("username", ""), request.form.get("password", "")):
+            session["user"] = request.form.get("username", "").strip()
+            return redirect(request.form.get("next") or "/")
+        return render_template_string(_LOGIN, error="Invalid username or password.",
+                                      next=nxt, logo=logo, logo_ver=ver)
+    if auth.current_user():
+        return redirect("/")
+    return render_template_string(_LOGIN, error=None, next=nxt, logo=logo, logo_ver=ver)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
+@app.route("/branding/logo")
+def branding_logo():
+    p = _logo_path()
+    if not p:
+        abort(404)
+    return send_file(os.path.abspath(p))
+
+
+@app.route("/admin/logo", methods=["POST"])
+@auth.require_perm("admin")
+def admin_logo():
+    f = request.files.get("logo")
+    if not f or not f.filename:
+        return jsonify({"ok": False, "message": "Choose an image file."})
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in LOGO_EXTS:
+        return jsonify({"ok": False, "message": "Use PNG, JPG, GIF, SVG, or WEBP."})
+    os.makedirs(BRANDING_DIR, exist_ok=True)
+    for old in glob.glob(os.path.join(BRANDING_DIR, "logo.*")):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    f.save(os.path.join(BRANDING_DIR, "logo" + ext))
+    return jsonify({"ok": True, "message": "Logo updated."})
+
+
+@app.route("/admin/logo/delete", methods=["POST"])
+@auth.require_perm("admin")
+def admin_logo_delete():
+    for old in glob.glob(os.path.join(BRANDING_DIR, "logo.*")):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return jsonify({"ok": True, "message": "Logo removed."})
+
+
 @app.route("/")
+@auth.login_required
 def index():
+    user = auth.current_user()
+    perms = {p for p in auth.PRIV_KEYS if auth.has_perm(user, p)}
+    active_tab = "tab-generate" if "generate" in perms else "tab-history"
     return render_template_string(
         _PAGE, cfg=CONFIG, reports=_list_reports(), provider=CONFIG.llm.provider,
         model=getattr(CONFIG.llm, f"{CONFIG.llm.provider}_model", ""),
         severities=SEVERITY_CHOICES, schedule=_load_schedule(), next_run=_next_run(),
-        smtp_ready=_smtp_ready(), stats=_latest_stats(),
-        presets=PRESET_LABELS,
+        smtp_ready=_smtp_ready(), stats=_latest_stats(), presets=PRESET_LABELS,
+        user=user, perms=perms, is_admin=auth.has_perm(user, "admin"),
+        all_privileges=auth.PRIVILEGES, active_tab=active_tab,
+        logo=bool(_logo_path()), logo_ver=_logo_ver(),
     )
 
 
+# ── user administration (admin only) ─────────────────────────────────────────
+@app.route("/admin/users")
+@auth.require_perm("admin")
+def admin_users():
+    return jsonify({"users": auth.list_users(), "privileges": auth.PRIVILEGES})
+
+
+@app.route("/admin/users/create", methods=["POST"])
+@auth.require_perm("admin")
+def admin_create():
+    ok, msg = auth.create_user(request.form.get("username", ""),
+                               request.form.get("password", ""),
+                               request.form.getlist("privileges"))
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/admin/users/update", methods=["POST"])
+@auth.require_perm("admin")
+def admin_update():
+    ok, msg = auth.update_privileges(request.form.get("username", ""),
+                                     request.form.getlist("privileges"))
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/admin/users/password", methods=["POST"])
+@auth.require_perm("admin")
+def admin_password():
+    ok, msg = auth.set_password(request.form.get("username", ""),
+                                request.form.get("password", ""))
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/admin/users/delete", methods=["POST"])
+@auth.require_perm("admin")
+def admin_delete():
+    ok, msg = auth.delete_user(request.form.get("username", ""))
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/account/password", methods=["POST"])
+@auth.login_required
+def account_password():
+    user = auth.current_user()
+    if not auth.verify(user["username"], request.form.get("current", "")):
+        return jsonify({"ok": False, "message": "Current password is incorrect."})
+    ok, msg = auth.set_password(user["username"], request.form.get("new", ""))
+    return jsonify({"ok": ok, "message": msg})
+
+
 @app.route("/run", methods=["POST"])
+@auth.require_perm("generate")
 def run():
     params = request.form.to_dict()
     params["extra_instructions"] = _build_instructions(request.form)
@@ -283,6 +414,7 @@ def _run_analyze_job(job_id, paths, email_to):
 
 
 @app.route("/analyze", methods=["POST"])
+@auth.require_perm("analyze")
 def analyze():
     files = [f for f in request.files.getlist("files") if f and f.filename]
     if not files:
@@ -308,6 +440,7 @@ def analyze():
 
 
 @app.route("/status/<job_id>")
+@auth.login_required
 def status(job_id):
     job = JOBS.get(job_id)
     if not job:
@@ -316,6 +449,7 @@ def status(job_id):
 
 
 @app.route("/stop/<job_id>", methods=["POST"])
+@auth.require_perm("generate")
 def stop(job_id):
     job = JOBS.get(job_id)
     if not job:
@@ -326,6 +460,7 @@ def stop(job_id):
 
 
 @app.route("/schedule", methods=["POST"])
+@auth.require_perm("schedule")
 def save_schedule():
     f = request.form
     presets = [k for k in PRESETS if f.get("preset_" + k) == "on"]
@@ -357,6 +492,7 @@ def save_schedule():
 
 
 @app.route("/test-email", methods=["POST"])
+@auth.require_perm("schedule")
 def test_email():
     to = (request.form.get("email") or "").strip()
     if not to:
@@ -374,6 +510,7 @@ def test_email():
 
 
 @app.route("/reports/<path:filename>")
+@auth.login_required
 def view_report(filename):
     safe = os.path.basename(filename)
     full = os.path.join(report.REPORTS_DIR, safe)
@@ -383,6 +520,7 @@ def view_report(filename):
 
 
 @app.route("/download/<path:filename>")
+@auth.login_required
 def download_report(filename):
     """Download a briefing as HTML (default), PDF (?fmt=pdf), or Markdown (?fmt=md)."""
     stem = os.path.splitext(os.path.basename(filename))[0]
@@ -419,6 +557,7 @@ def download_report(filename):
 
 
 @app.route("/delete", methods=["POST"])
+@auth.require_perm("delete")
 def delete_report():
     stem = os.path.splitext(os.path.basename(request.form.get("filename", "")))[0]
     if not stem:
@@ -433,6 +572,7 @@ def delete_report():
 
 
 @app.route("/clear", methods=["POST"])
+@auth.require_perm("delete")
 def clear_reports():
     count = 0
     for pattern in ("*.html", "*.md"):
@@ -445,6 +585,35 @@ def clear_reports():
     return jsonify({"ok": True, "deleted": count})
 
 
+_LOGIN = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — Threat Intelligence Briefing Agent</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:'Segoe UI',-apple-system,Arial,sans-serif; background:linear-gradient(135deg,#0f2a43,#1d4671); }
+  .box { background:#fff; padding:30px 28px; border-radius:12px; width:340px; max-width:92vw; box-shadow:0 10px 40px rgba(0,0,0,.25); }
+  h1 { font-size:18px; color:#0f2a43; margin:0 0 4px; }
+  p.sub { font-size:12px; color:#6b7280; margin:0 0 20px; }
+  label { display:block; font-size:12px; color:#6b7280; margin:12px 0 4px; }
+  input { width:100%; padding:11px 12px; border:1px solid #e2e5e9; border-radius:8px; font-size:16px; box-sizing:border-box; }
+  button { width:100%; margin-top:18px; background:#0f2a43; color:#fff; border:0; padding:12px; border-radius:8px; font-size:15px; cursor:pointer; }
+  .err { background:#fef2f2; color:#b42318; border:1px solid #f3c0b8; padding:9px 11px; border-radius:8px; font-size:13px; margin-bottom:8px; }
+</style></head>
+<body>
+  <form class="box" method="post" action="/login">
+    {% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="Logo" style="max-height:72px;max-width:220px;display:block;margin:0 auto 16px;">{% endif %}
+    <h1>Threat Intelligence Briefing Agent</h1>
+    <p class="sub">Sign in to continue</p>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    <input type="hidden" name="next" value="{{ next }}">
+    <label>Username</label><input name="username" autofocus autocomplete="username">
+    <label>Password</label><input name="password" type="password" autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+</body></html>"""
+
+
 _PAGE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -453,8 +622,11 @@ _PAGE = """<!DOCTYPE html>
   :root { --navy:#0f2a43; --line:#e2e5e9; --muted:#6b7280; --accent:#1d4671; }
   * { box-sizing:border-box; }
   body { margin:0; font-family:'Segoe UI',-apple-system,Arial,sans-serif; background:#eef1f5; color:#1f2328; }
-  header { background:linear-gradient(135deg,#0f2a43,#1d4671); color:#fff; padding:20px 28px; }
-  header h1 { margin:0; font-size:20px; }
+  header { background:linear-gradient(135deg,#0f2a43,#1d4671); color:#fff; padding:18px 28px; }
+  header .hwrap { max-width:960px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  header h1 { margin:0; font-size:19px; }
+  header .huser { font-size:13px; opacity:.9; display:flex; align-items:center; gap:12px; white-space:nowrap; }
+  header .huser a { color:#fff; opacity:.85; }
   .tabbar { background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
   .tabbar .wrapbar { max-width:960px; margin:0 auto; display:flex; gap:2px; padding:0 16px; flex-wrap:wrap; }
   .tabbtn { background:none; border:0; padding:14px 16px; margin:0; color:var(--muted); font-size:14px; cursor:pointer; border-bottom:3px solid transparent; border-radius:0; }
@@ -523,14 +695,18 @@ _PAGE = """<!DOCTYPE html>
   }
 </style></head>
 <body>
-<header><h1>Threat Intelligence Briefing Agent</h1></header>
+<header><div class="hwrap">
+  <h1 style="display:flex;align-items:center;gap:10px;">{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" style="height:30px;border-radius:4px;background:#fff;padding:2px;">{% endif %}Threat Intelligence Briefing Agent</h1>
+  <div class="huser">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
+</div></header>
 <nav class="tabbar"><div class="wrapbar">
-  <button class="tabbtn active" data-tab="tab-generate">Generate</button>
-  <button class="tabbtn" data-tab="tab-analyze">Analyze file</button>
-  <button class="tabbtn" data-tab="tab-schedule">Schedule</button>
-  <button class="tabbtn" data-tab="tab-history">History</button>
+  {% if 'generate' in perms %}<button class="tabbtn {{ 'active' if active_tab=='tab-generate' }}" data-tab="tab-generate">Generate</button>{% endif %}
+  {% if 'analyze' in perms %}<button class="tabbtn" data-tab="tab-analyze">Analyze file</button>{% endif %}
+  {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
+  <button class="tabbtn {{ 'active' if active_tab=='tab-history' }}" data-tab="tab-history">History</button>
   <button class="tabbtn" data-tab="tab-dashboard">Dashboard</button>
   <button class="tabbtn" data-tab="tab-settings">Settings</button>
+  {% if is_admin %}<button class="tabbtn" data-tab="tab-admin">Admin</button>{% endif %}
 </div></nav>
 <div class="wrap">
 
@@ -547,7 +723,8 @@ _PAGE = """<!DOCTYPE html>
   </div>
   </section>
 
-  <section class="tab active" id="tab-generate">
+  {% if 'generate' in perms %}
+  <section class="tab {{ 'active' if active_tab=='tab-generate' }}" id="tab-generate">
   <div class="card">
     <h2>Generate a briefing</h2>
     <form id="run-form">
@@ -579,7 +756,9 @@ _PAGE = """<!DOCTYPE html>
     <div id="console" class="console"></div>
   </div>
   </section>
+  {% endif %}
 
+  {% if 'analyze' in perms %}
   <section class="tab" id="tab-analyze">
   <div class="card">
     <h2>Analyze a threat document</h2>
@@ -595,7 +774,9 @@ _PAGE = """<!DOCTYPE html>
     <div id="a-console" class="console"></div>
   </div>
   </section>
+  {% endif %}
 
+  {% if 'schedule' in perms %}
   <section class="tab" id="tab-schedule">
   <div class="card">
     <h2>Email schedule</h2>
@@ -643,8 +824,9 @@ _PAGE = """<!DOCTYPE html>
     <div class="note">Times are UTC. The schedule runs only while this app is running.</div>
   </div>
   </section>
+  {% endif %}
 
-  <section class="tab" id="tab-history">
+  <section class="tab {{ 'active' if active_tab=='tab-history' }}" id="tab-history">
   <div class="card">
     <h2>Past briefings</h2>
     <input id="search" type="search" placeholder="Filter briefings by name...">
@@ -688,9 +870,64 @@ _PAGE = """<!DOCTYPE html>
       <div><label>SMTP port</label><input value="{{ cfg.email.smtp_port }}" readonly></div>
     </div>
   </div>
+  <div class="card">
+    <h2>Change my password</h2>
+    <form id="pw-form">
+      <div class="grid3">
+        <div><label>Current password</label><input name="current" type="password" autocomplete="current-password"></div>
+        <div><label>New password</label><input name="new" type="password" autocomplete="new-password"></div>
+      </div>
+      <button type="submit">Update password</button>
+      <span id="pw-state" class="pill" style="display:none"></span>
+    </form>
+  </div>
   </section>
 
+  {% if is_admin %}
+  <section class="tab" id="tab-admin">
+  <div class="card">
+    <h2>Company logo</h2>
+    <p class="note">Appears on the login screen and in the header. PNG, JPG, GIF, SVG, or WEBP.</p>
+    {% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="Current logo" style="max-height:64px;max-width:220px;display:block;margin:8px 0 12px;border:1px solid var(--line);border-radius:6px;padding:6px;background:#fff;">{% endif %}
+    <form id="logo-form">
+      <input type="file" name="logo" accept=".png,.jpg,.jpeg,.gif,.svg,.webp">
+      <div class="row">
+        <button type="submit">Upload logo</button>
+        {% if logo %}<button id="logo-del" type="button" class="secondary" style="margin-left:8px">Remove logo</button>{% endif %}
+        <span id="logo-state" class="pill" style="display:none"></span>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>User management</h2>
+    <p class="note">Create users and grant per-feature privileges. Admins have every privilege.</p>
+    <table style="width:100%;border-collapse:collapse;margin-top:8px" id="user-table"></table>
+  </div>
+  <div class="card">
+    <h2>Create user</h2>
+    <form id="newuser-form">
+      <div class="grid3">
+        <div><label>Username</label><input name="username" autocomplete="off"></div>
+        <div><label>Password</label><input name="password" type="password" autocomplete="new-password"></div>
+      </div>
+      <div class="row"><label>Privileges</label>
+        <div class="presets">
+          {% for k,lbl in all_privileges %}<label><input type="checkbox" name="privileges" value="{{ k }}"> {{ lbl }}</label>{% endfor %}
+        </div>
+      </div>
+      <button type="submit">Create user</button>
+      <span id="nu-state" class="pill" style="display:none"></span>
+    </form>
+  </div>
+  </section>
+  {% endif %}
+
 </div>
+<script>
+window.__ALL_PRIVS = [{% for k,lbl in all_privileges %}["{{ k }}","{{ lbl }}"]{% if not loop.last %},{% endif %}{% endfor %}];
+const _fetch = window.fetch;
+window.fetch = async (...a) => { const r = await _fetch(...a); if (r.status === 401) { location.href = '/login'; } return r; };
+</script>
 <script>
 document.querySelectorAll('.tabbtn').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('.tabbtn').forEach(x => x.classList.remove('active'));
@@ -702,8 +939,10 @@ document.querySelectorAll('.tabbtn').forEach(b => b.addEventListener('click', ()
 <script>
 const freq = document.getElementById('freq');
 const wdWrap = document.getElementById('weekday-wrap');
-function syncFreq(){ wdWrap.style.display = freq.value === 'weekly' ? 'block' : 'none'; }
-freq.addEventListener('change', syncFreq); syncFreq();
+if (freq && wdWrap) {
+  const syncFreq = () => { wdWrap.style.display = freq.value === 'weekly' ? 'block' : 'none'; };
+  freq.addEventListener('change', syncFreq); syncFreq();
+}
 
 const form = document.getElementById('run-form');
 const btn = document.getElementById('run-btn');
@@ -714,7 +953,7 @@ const list = document.getElementById('report-list');
 const preview = document.getElementById('preview');
 let currentJob = null;
 
-form.addEventListener('submit', async (e) => {
+if (form) form.addEventListener('submit', async (e) => {
   e.preventDefault();
   btn.disabled = true; con.style.display = 'block'; con.textContent = '';
   state.style.display = 'inline'; state.textContent = 'running...'; state.className = 'pill';
@@ -724,7 +963,7 @@ form.addEventListener('submit', async (e) => {
   poll(job_id);
 });
 
-stopBtn.addEventListener('click', async () => {
+if (stopBtn) stopBtn.addEventListener('click', async () => {
   if (!currentJob) return;
   stopBtn.disabled = true; state.textContent = 'stopping...';
   await fetch('/stop/' + currentJob, { method:'POST' });
@@ -822,31 +1061,31 @@ document.getElementById('search').addEventListener('input', (e) => {
 // schedule save
 const sform = document.getElementById('sched-form');
 const sstate = document.getElementById('sched-state');
-sform.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const res = await fetch('/schedule', { method:'POST', body: new FormData(sform) });
-  const data = await res.json();
-  if (data.enabled && data.next_run) { sstate.textContent = 'Saved - next run: ' + data.next_run; sstate.className = 'pill ok'; }
-  else { sstate.textContent = 'Schedule disabled'; sstate.className = 'pill'; }
-});
-
-// test email
-document.getElementById('test-btn').addEventListener('click', async () => {
-  const fd = new FormData();
-  fd.append('email', sform.querySelector('[name=email]').value);
-  sstate.textContent = 'sending test...'; sstate.className = 'pill';
-  const res = await fetch('/test-email', { method:'POST', body: fd });
-  const data = await res.json();
-  sstate.textContent = data.ok ? 'Test email sent' : ('Test failed: ' + data.error);
-  sstate.className = data.ok ? 'pill ok' : 'pill err';
-});
+if (sform) {
+  sform.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const res = await fetch('/schedule', { method:'POST', body: new FormData(sform) });
+    const data = await res.json();
+    if (data.enabled && data.next_run) { sstate.textContent = 'Saved - next run: ' + data.next_run; sstate.className = 'pill ok'; }
+    else { sstate.textContent = 'Schedule disabled'; sstate.className = 'pill'; }
+  });
+  document.getElementById('test-btn').addEventListener('click', async () => {
+    const fd = new FormData();
+    fd.append('email', sform.querySelector('[name=email]').value);
+    sstate.textContent = 'sending test...'; sstate.className = 'pill';
+    const res = await fetch('/test-email', { method:'POST', body: fd });
+    const data = await res.json();
+    sstate.textContent = data.ok ? 'Test email sent' : ('Test failed: ' + data.error);
+    sstate.className = data.ok ? 'pill ok' : 'pill err';
+  });
+}
 
 // analyze file upload
 const aform = document.getElementById('analyze-form');
 const abtn = document.getElementById('analyze-btn');
 const acon = document.getElementById('a-console');
 const astate = document.getElementById('a-state');
-aform.addEventListener('submit', async (e) => {
+if (aform) aform.addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!document.getElementById('analyze-files').files.length) { alert('Choose a file to analyze.'); return; }
   abtn.disabled = true; acon.style.display = 'block'; acon.textContent = '';
@@ -880,11 +1119,91 @@ async function pollAnalyze(jobId) {
     acon.textContent += '\\n\\nError: ' + err;
   }
 }
+
+// change my password
+const pwf = document.getElementById('pw-form');
+if (pwf) pwf.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const r = await fetch('/account/password', { method:'POST', body: new FormData(pwf) });
+  const d = await r.json();
+  const s = document.getElementById('pw-state');
+  s.style.display = 'inline'; s.textContent = d.message; s.className = 'pill ' + (d.ok ? 'ok' : 'err');
+  if (d.ok) pwf.reset();
+});
+
+// admin: user management
+const userTable = document.getElementById('user-table');
+if (userTable) {
+  const privs = window.__ALL_PRIVS;
+  async function loadUsers() {
+    const d = await (await fetch('/admin/users')).json();
+    let html = '<tr style="text-align:left;border-bottom:2px solid #e2e5e9">' +
+               '<th style="padding:8px">User</th><th style="padding:8px">Privileges</th><th style="padding:8px">Actions</th></tr>';
+    d.users.forEach(u => {
+      const checks = '<div style="display:flex;flex-wrap:wrap;gap:6px 16px">' + privs.map(p =>
+        '<label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;font-size:12px;margin:0">' +
+        '<input type="checkbox" data-user="' + u.username + '" value="' + p[0] + '" ' +
+        (u.privileges.indexOf(p[0]) >= 0 ? 'checked' : '') + '>' + p[1] + '</label>').join('') + '</div>';
+      html += '<tr style="border-bottom:1px solid #eef1f4">' +
+        '<td style="padding:8px;font-weight:600">' + u.username + '</td>' +
+        '<td style="padding:8px">' + checks + '</td>' +
+        '<td style="padding:8px;white-space:nowrap">' +
+        '<button class="dl" type="button" data-act="save" data-user="' + u.username + '">Save</button> ' +
+        '<button class="dl" type="button" data-act="pw" data-user="' + u.username + '">Reset PW</button> ' +
+        '<button class="del" type="button" data-act="del" data-user="' + u.username + '">Delete</button></td></tr>';
+    });
+    userTable.innerHTML = html;
+  }
+  userTable.addEventListener('click', async (e) => {
+    const act = e.target.getAttribute('data-act'); if (!act) return;
+    const user = e.target.getAttribute('data-user');
+    const fd = new FormData(); fd.append('username', user);
+    if (act === 'save') {
+      userTable.querySelectorAll('input[type=checkbox][data-user="' + user + '"]:checked').forEach(c => fd.append('privileges', c.value));
+      const d = await (await fetch('/admin/users/update', { method:'POST', body: fd })).json(); alert(d.message);
+    } else if (act === 'pw') {
+      const pw = prompt('New password for ' + user); if (!pw) return;
+      fd.append('password', pw);
+      const d = await (await fetch('/admin/users/password', { method:'POST', body: fd })).json(); alert(d.message);
+    } else if (act === 'del') {
+      if (!confirm('Delete user ' + user + '?')) return;
+      const d = await (await fetch('/admin/users/delete', { method:'POST', body: fd })).json();
+      alert(d.message); loadUsers();
+    }
+  });
+  document.getElementById('newuser-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const d = await (await fetch('/admin/users/create', { method:'POST', body: new FormData(e.target) })).json();
+    const s = document.getElementById('nu-state');
+    s.style.display = 'inline'; s.textContent = d.message; s.className = 'pill ' + (d.ok ? 'ok' : 'err');
+    if (d.ok) { e.target.reset(); loadUsers(); }
+  });
+  loadUsers();
+
+  // company logo
+  const logoForm = document.getElementById('logo-form');
+  if (logoForm) {
+    logoForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const d = await (await fetch('/admin/logo', { method:'POST', body: new FormData(logoForm) })).json();
+      const s = document.getElementById('logo-state');
+      s.style.display = 'inline'; s.textContent = d.message; s.className = 'pill ' + (d.ok ? 'ok' : 'err');
+      if (d.ok) setTimeout(() => location.reload(), 700);
+    });
+    const del = document.getElementById('logo-del');
+    if (del) del.addEventListener('click', async () => {
+      if (!confirm('Remove the company logo?')) return;
+      const d = await (await fetch('/admin/logo/delete', { method:'POST' })).json();
+      if (d.ok) location.reload();
+    });
+  }
+}
 </script>
 </body></html>"""
 
 
 def _startup():
+    auth.ensure_admin()
     _SCHED.start()
     saved = _load_schedule()
     if saved:

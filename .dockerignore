@@ -2,6 +2,9 @@
 reports/
 uploads/
 schedule.json
+users.json
+.flask_secret
+branding/
 __pycache__/
 *.pyc
 .venv/
