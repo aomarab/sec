@@ -59,6 +59,31 @@ def _logo_ver():
 SEVERITY_CHOICES = [(9.0, "Critical only"), (7.0, "High and Critical"),
                     (4.0, "Medium and above"), (0.0, "All severities")]
 
+REGIONS = ["Global", "North America", "United States", "Canada", "Latin America",
+           "Europe", "European Union", "United Kingdom", "EMEA", "Middle East",
+           "Gulf / GCC", "Africa", "Asia-Pacific", "South Asia", "East Asia",
+           "Southeast Asia", "Oceania"]
+
+INDUSTRIES = ["Technology", "Software & SaaS", "Finance & Banking", "Insurance",
+              "Healthcare", "Pharmaceutical", "Government / Public Sector",
+              "Defense", "Critical Infrastructure", "Energy & Utilities",
+              "Oil & Gas", "Manufacturing", "Automotive", "Retail & E-commerce",
+              "Telecommunications", "Transportation & Logistics", "Aviation",
+              "Education", "Media & Entertainment", "Legal", "Hospitality",
+              "Non-profit / NGO"]
+
+
+def _with_current(options: list[str], *current: str) -> list[str]:
+    """Return options with any current selected values (comma-separated, possibly
+    multiple) that aren't already in the list prepended, preserving order."""
+    extra: list[str] = []
+    for c in current:
+        for v in (c or "").split(","):
+            v = v.strip()
+            if v and v not in options and v not in extra:
+                extra.append(v)
+    return extra + options
+
 # Preset key -> instruction snippet appended to the agent's system prompt.
 PRESETS = {
     "ransomware": "Focus on vulnerabilities with known ransomware-campaign use and call them out explicitly.",
@@ -134,14 +159,47 @@ def _generate(cfg, email_to=None, cancel_event=None) -> dict:
             "emailed": emailed}
 
 
+OWNERS_FILE = os.getenv("OWNERS_FILE", "report_owners.json")
+
+
+def _load_owners():
+    try:
+        with open(OWNERS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _set_owner(filename, owner):
+    with _LOCK:
+        owners = _load_owners()
+        owners[filename] = owner or ""
+        with open(OWNERS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(owners, fh, indent=2)
+
+
+def _remove_owners(filenames):
+    with _LOCK:
+        owners = _load_owners()
+        changed = False
+        for f in filenames:
+            if f in owners:
+                del owners[f]
+                changed = True
+        if changed:
+            with open(OWNERS_FILE, "w", encoding="utf-8") as fh:
+                json.dump(owners, fh, indent=2)
+
+
 def _list_reports():
     paths = sorted(glob.glob(os.path.join(report.REPORTS_DIR, "*.html")),
                    key=os.path.getmtime, reverse=True)
+    owners = _load_owners()
     out = []
     for p in paths:
         name = os.path.basename(p)
         kind = "analysis" if name.startswith("analysis-") else "briefing"
-        out.append({"filename": name, "kind": kind})
+        out.append({"filename": name, "kind": kind, "owner": owners.get(name, "")})
     return out
 
 
@@ -164,16 +222,19 @@ def _latest_stats():
 
 
 # ── on-demand job ───────────────────────────────────────────────────────────
-def _run_job(job_id, cfg, email_to, cancel_event):
+def _run_job(job_id, cfg, email_to, cancel_event, owner):
     job = JOBS[job_id]
     handler = _ListHandler(job["logs"])
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.addHandler(handler)
     try:
-        job["report"] = _generate(cfg, email_to, cancel_event)
+        meta = _generate(cfg, email_to, cancel_event)
+        _set_owner(meta["filename"], owner)
+        meta["owner"] = owner
+        job["report"] = meta
         job["status"] = "done"
-        log.info("Briefing ready: %s", job["report"]["title"])
+        log.info("Briefing ready: %s", meta["title"])
     except Cancelled:
         job["status"] = "stopped"
         job["error"] = "Stopped by user."
@@ -311,6 +372,9 @@ def index():
         user=user, perms=perms, is_admin=auth.has_perm(user, "admin"),
         all_privileges=auth.PRIVILEGES, active_tab=active_tab,
         logo=bool(_logo_path()), logo_ver=_logo_ver(),
+        password_rule=auth.PASSWORD_RULE,
+        regions=_with_current(REGIONS, CONFIG.region, _load_schedule().get("region")),
+        industries=_with_current(INDUSTRIES, CONFIG.industry, _load_schedule().get("industry")),
     )
 
 
@@ -367,19 +431,26 @@ def account_password():
 @auth.require_perm("generate")
 def run():
     params = request.form.to_dict()
+    regions = request.form.getlist("region")
+    industries = request.form.getlist("industry")
+    if regions:
+        params["region"] = ", ".join(regions)
+    if industries:
+        params["industry"] = ", ".join(industries)
     params["extra_instructions"] = _build_instructions(request.form)
     cfg = _apply_params(copy.deepcopy(CONFIG), params)
     email_to = (request.form.get("email") or "").strip() or None
+    owner = auth.current_user()["username"]
     job_id = uuid.uuid4().hex[:12]
     cancel = threading.Event()
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None,
                         "error": None, "cancel": cancel}
-    threading.Thread(target=_run_job, args=(job_id, cfg, email_to, cancel), daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, cfg, email_to, cancel, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
-def _run_analyze_job(job_id, paths, email_to):
+def _run_analyze_job(job_id, paths, email_to, owner):
     job = JOBS[job_id]
     handler = _ListHandler(job["logs"])
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
@@ -390,6 +461,8 @@ def _run_analyze_job(job_id, paths, email_to):
         for p in paths:
             markdown = analyze_document(p, CONFIG)
             out = report.render(markdown, prefix="analysis")
+            fname = os.path.basename(out["html_path"])
+            _set_owner(fname, owner)
             emailed = False
             if email_to:
                 mail_cfg = copy.deepcopy(CONFIG.email)
@@ -398,9 +471,8 @@ def _run_analyze_job(job_id, paths, email_to):
                 emailed = delivery.send_email(
                     mail_cfg, subject=out["title"], html_body=out["html"], markdown_body=markdown,
                 )
-            reports.append({"title": out["title"],
-                            "filename": os.path.basename(out["html_path"]),
-                            "emailed": emailed})
+            reports.append({"title": out["title"], "filename": fname,
+                            "emailed": emailed, "owner": owner})
             log.info("Analysis ready: %s", out["title"])
         job["reports"] = reports
         job["report"] = reports[-1] if reports else None
@@ -431,11 +503,12 @@ def analyze():
         f.save(dest)
         paths.append(dest)
     email_to = (request.form.get("email") or "").strip() or None
+    owner = auth.current_user()["username"]
     job_id = uuid.uuid4().hex[:12]
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None,
                         "reports": None, "error": None}
-    threading.Thread(target=_run_analyze_job, args=(job_id, paths, email_to), daemon=True).start()
+    threading.Thread(target=_run_analyze_job, args=(job_id, paths, email_to, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
@@ -474,8 +547,8 @@ def save_schedule():
         "weekday": f.get("weekday", "mon"),
         "time": f.get("time", "07:00"),
         "email": (f.get("email") or "").strip(),
-        "region": f.get("region", CONFIG.region),
-        "industry": f.get("industry", CONFIG.industry),
+        "region": ", ".join(f.getlist("region")) or CONFIG.region,
+        "industry": ", ".join(f.getlist("industry")) or CONFIG.industry,
         "min_cvss": f.get("min_cvss", CONFIG.min_cvss),
         "look_back_days": f.get("look_back_days", CONFIG.look_back_days),
         "insights": f.get("insights", CONFIG.insights_to_research),
@@ -568,6 +641,7 @@ def delete_report():
         if os.path.isfile(p):
             os.remove(p)
             removed.append(os.path.basename(p))
+    _remove_owners([stem + ".html"])
     return jsonify({"ok": True, "removed": removed})
 
 
@@ -582,6 +656,11 @@ def clear_reports():
                 count += 1
             except OSError:
                 pass
+    with _LOCK:
+        try:
+            os.remove(OWNERS_FILE)
+        except OSError:
+            pass
     return jsonify({"ok": True, "deleted": count})
 
 
@@ -670,6 +749,15 @@ _PAGE = """<!DOCTYPE html>
   .kind { font-size:10px; padding:2px 7px; border-radius:999px; font-weight:600; flex-shrink:0; letter-spacing:.02em; text-transform:uppercase; }
   .kind.briefing { background:#dbeafe; color:#1e40af; }
   .kind.analysis { background:#ede9fe; color:#6d28d9; }
+  .by { color:#6b7280; font-size:12px; white-space:nowrap; }
+  .ms { position:relative; }
+  .ms-toggle { width:100%; margin-top:0; text-align:left; background:#fff; color:#1f2328; border:1px solid var(--line); padding:9px 10px; border-radius:6px; font-size:14px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .ms-toggle .ms-arrow { color:#6b7280; }
+  .ms-panel { position:absolute; z-index:30; left:0; right:0; top:calc(100% + 4px); background:#fff; border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.14); max-height:240px; overflow:auto; padding:6px; display:none; }
+  .ms.open .ms-panel { display:block; }
+  .ms-opt { display:flex; align-items:center; gap:8px; padding:6px 8px; font-size:13px; border-radius:6px; cursor:pointer; margin:0; white-space:nowrap; }
+  .ms-opt:hover { background:#f4f8ff; }
+  .ms-opt input { width:auto; margin:0; }
   a { color:#1f6feb; text-decoration:none; } a:hover { text-decoration:underline; }
   .actions { display:flex; gap:6px; align-items:center; flex-shrink:0; flex-wrap:wrap; }
   .dl, .pv { font-size:12px; border:1px solid var(--line); padding:4px 9px; border-radius:6px; color:#1f6feb; cursor:pointer; background:#fff; }
@@ -695,6 +783,14 @@ _PAGE = """<!DOCTYPE html>
   }
 </style></head>
 <body>
+{% macro multiselect(name, options, selected) %}
+<div class="ms" data-name="{{ name }}">
+  <button type="button" class="ms-toggle"><span class="ms-label">Select…</span><span class="ms-arrow">▾</span></button>
+  <div class="ms-panel">
+    {% for o in options %}<label class="ms-opt"><input type="checkbox" name="{{ name }}" value="{{ o }}" {% if o in selected %}checked{% endif %}> {{ o }}</label>{% endfor %}
+  </div>
+</div>
+{% endmacro %}
 <header><div class="hwrap">
   <h1 style="display:flex;align-items:center;gap:10px;">{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" style="height:30px;border-radius:4px;background:#fff;padding:2px;">{% endif %}Threat Intelligence Briefing Agent</h1>
   <div class="huser">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
@@ -729,8 +825,8 @@ _PAGE = """<!DOCTYPE html>
     <h2>Generate a briefing</h2>
     <form id="run-form">
       <div class="grid3">
-        <div><label>Region focus</label><input name="region" value="{{ cfg.region }}"></div>
-        <div><label>Industry focus</label><input name="industry" value="{{ cfg.industry }}"></div>
+        <div><label>Region focus</label>{{ multiselect('region', regions, cfg.region.split(', ')) }}</div>
+        <div><label>Industry focus</label>{{ multiselect('industry', industries, cfg.industry.split(', ')) }}</div>
         <div><label>Minimum severity</label>
           <select name="min_cvss">
             {% for val,lbl in severities %}<option value="{{ val }}" {% if cfg.min_cvss == val %}selected{% endif %}>{{ lbl }}</option>{% endfor %}
@@ -805,8 +901,8 @@ _PAGE = """<!DOCTYPE html>
             {% for val,lbl in severities %}<option value="{{ val }}" {% if (schedule.min_cvss|float if schedule.min_cvss else cfg.min_cvss) == val %}selected{% endif %}>{{ lbl }}</option>{% endfor %}
           </select>
         </div>
-        <div><label>Region</label><input name="region" value="{{ schedule.region or cfg.region }}"></div>
-        <div><label>Industry</label><input name="industry" value="{{ schedule.industry or cfg.industry }}"></div>
+        <div><label>Region</label>{{ multiselect('region', regions, (schedule.region or cfg.region).split(', ')) }}</div>
+        <div><label>Industry</label>{{ multiselect('industry', industries, (schedule.industry or cfg.industry).split(', ')) }}</div>
         <div><label>Look-back (days)</label><input name="look_back_days" type="number" min="1" max="119" value="{{ schedule.look_back_days or cfg.look_back_days }}"></div>
         <div><label>Insights</label><input name="insights" type="number" min="1" max="50" value="{{ schedule.insights or cfg.insights_to_research }}"></div>
       </div>
@@ -833,7 +929,7 @@ _PAGE = """<!DOCTYPE html>
     <ul class="reports" id="report-list">
       {% for r in reports %}
         <li data-file="{{ r.filename }}">
-          <span class="name"><span class="kind {{ r.kind }}">{{ 'Analysis' if r.kind == 'analysis' else 'Briefing' }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a></span>
+          <span class="name"><span class="kind {{ r.kind }}">{{ 'Analysis' if r.kind == 'analysis' else 'Briefing' }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
           <span class="actions">
             <button class="pv" type="button" data-file="{{ r.filename }}">Preview</button>
             <a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a>
@@ -870,21 +966,7 @@ _PAGE = """<!DOCTYPE html>
       <div><label>SMTP port</label><input value="{{ cfg.email.smtp_port }}" readonly></div>
     </div>
   </div>
-  <div class="card">
-    <h2>Change my password</h2>
-    <form id="pw-form">
-      <div class="grid3">
-        <div><label>Current password</label><input name="current" type="password" autocomplete="current-password"></div>
-        <div><label>New password</label><input name="new" type="password" autocomplete="new-password"></div>
-      </div>
-      <button type="submit">Update password</button>
-      <span id="pw-state" class="pill" style="display:none"></span>
-    </form>
-  </div>
-  </section>
-
   {% if is_admin %}
-  <section class="tab" id="tab-admin">
   <div class="card">
     <h2>Company logo</h2>
     <p class="note">Appears on the login screen and in the header. PNG, JPG, GIF, SVG, or WEBP.</p>
@@ -898,6 +980,23 @@ _PAGE = """<!DOCTYPE html>
       </div>
     </form>
   </div>
+  {% endif %}
+  <div class="card">
+    <h2>Change my password</h2>
+    <form id="pw-form">
+      <div class="grid3">
+        <div><label>Current password</label><input name="current" type="password" autocomplete="current-password"></div>
+        <div><label>New password</label><input name="new" type="password" autocomplete="new-password"></div>
+      </div>
+      <div class="note">{{ password_rule }}</div>
+      <button type="submit">Update password</button>
+      <span id="pw-state" class="pill" style="display:none"></span>
+    </form>
+  </div>
+  </section>
+
+  {% if is_admin %}
+  <section class="tab" id="tab-admin">
   <div class="card">
     <h2>User management</h2>
     <p class="note">Create users and grant per-feature privileges. Admins have every privilege.</p>
@@ -910,6 +1009,7 @@ _PAGE = """<!DOCTYPE html>
         <div><label>Username</label><input name="username" autocomplete="off"></div>
         <div><label>Password</label><input name="password" type="password" autocomplete="new-password"></div>
       </div>
+      <div class="note">{{ password_rule }}</div>
       <div class="row"><label>Privileges</label>
         <div class="presets">
           {% for k,lbl in all_privileges %}<label><input type="checkbox" name="privileges" value="{{ k }}"> {{ lbl }}</label>{% endfor %}
@@ -935,6 +1035,27 @@ document.querySelectorAll('.tabbtn').forEach(b => b.addEventListener('click', ()
   b.classList.add('active');
   document.getElementById(b.dataset.tab).classList.add('active');
 }));
+
+// checkbox dropdowns (multi-select)
+document.querySelectorAll('.ms').forEach(ms => {
+  const toggle = ms.querySelector('.ms-toggle');
+  const label = ms.querySelector('.ms-label');
+  const panel = ms.querySelector('.ms-panel');
+  const boxes = ms.querySelectorAll('input[type=checkbox]');
+  const summary = () => {
+    const sel = [...boxes].filter(b => b.checked).map(b => b.value);
+    label.textContent = sel.length === 0 ? 'Select…' : (sel.length <= 2 ? sel.join(', ') : sel.length + ' selected');
+  };
+  toggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.querySelectorAll('.ms.open').forEach(o => { if (o !== ms) o.classList.remove('open'); });
+    ms.classList.toggle('open');
+  });
+  panel.addEventListener('click', (e) => e.stopPropagation());
+  boxes.forEach(b => b.addEventListener('change', summary));
+  summary();
+});
+document.addEventListener('click', () => document.querySelectorAll('.ms.open').forEach(o => o.classList.remove('open')));
 </script>
 <script>
 const freq = document.getElementById('freq');
@@ -969,11 +1090,12 @@ if (stopBtn) stopBtn.addEventListener('click', async () => {
   await fetch('/stop/' + currentJob, { method:'POST' });
 });
 
-function rowHtml(f) {
+function rowHtml(f, owner) {
   const kind = f.indexOf('analysis-') === 0 ? 'analysis' : 'briefing';
   const label = kind === 'analysis' ? 'Analysis' : 'Briefing';
+  const by = owner ? '<span class="by">by ' + owner + '</span>' : '';
   return '<span class="name"><span class="kind ' + kind + '">' + label + '</span>' +
-         '<a href="/reports/' + f + '" target="_blank">' + f + '</a></span>' +
+         '<a href="/reports/' + f + '" target="_blank">' + f + '</a>' + by + '</span>' +
          '<span class="actions">' +
          '<button class="pv" type="button" data-file="' + f + '">Preview</button>' +
          '<a class="dl" href="/download/' + f + '?fmt=html">HTML</a>' +
@@ -981,12 +1103,12 @@ function rowHtml(f) {
          '<a class="dl" href="/download/' + f + '?fmt=md">MD</a>' +
          '<button class="del" type="button" data-file="' + f + '">Delete</button></span>';
 }
-function addReportRow(f) {
+function addReportRow(f, owner) {
   const empty = list.querySelector('li:not([data-file])');
   if (empty) empty.remove();
   const li = document.createElement('li');
   li.setAttribute('data-file', f);
-  li.innerHTML = rowHtml(f);
+  li.innerHTML = rowHtml(f, owner);
   list.insertBefore(li, list.firstChild);
   if (!document.getElementById('clear-btn')) {
     const b = document.createElement('button');
@@ -1005,7 +1127,7 @@ async function poll(jobId) {
     if (job.status === 'done') {
       state.textContent = job.report.emailed ? 'done (emailed)' : 'done'; state.className = 'pill ok';
       con.textContent += '\\n\\nBriefing ready: ' + job.report.title;
-      addReportRow(job.report.filename);
+      addReportRow(job.report.filename, job.report.owner);
       window.open('/reports/' + job.report.filename, '_blank');
     } else if (job.status === 'stopped') {
       state.textContent = 'stopped'; state.className = 'pill';
@@ -1108,7 +1230,7 @@ async function pollAnalyze(jobId) {
       const reps = job.reports || (job.report ? [job.report] : []);
       astate.textContent = 'done (' + reps.length + ')'; astate.className = 'pill ok';
       acon.textContent += '\\n\\nAnalysis complete: ' + reps.length + ' report(s).';
-      reps.forEach(rp => addReportRow(rp.filename));
+      reps.forEach(rp => addReportRow(rp.filename, rp.owner));
       if (reps[0]) window.open('/reports/' + reps[0].filename, '_blank');
     } else {
       astate.textContent = 'error'; astate.className = 'pill err';

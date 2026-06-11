@@ -1,0 +1,25 @@
+{
+  "admin": {
+    "password_hash": "scrypt:32768:8:1$oyYKSMAvc4gdEpkb$509dc104e7e5b308aeef887284bf1a9fe51c3789693552b33dfe410470f51a8c832e49d901f97b824c0ecaff433826e428d2ef675030371c4a32aba504eb0159",
+    "privileges": [
+      "admin"
+    ]
+  },
+  "abed": {
+    "password_hash": "scrypt:32768:8:1$snkZiqncI9cf28XU$d3f8382b8140a85045079188f03b88318128bd4a1437403f56388b1797d2623b9e97a3b7d3f061aab2686e3f58114eed404bb4ce817191574af0f587fc985b7c",
+    "privileges": [
+      "generate",
+      "analyze",
+      "schedule",
+      "delete",
+      "admin"
+    ]
+  },
+  "salah": {
+    "password_hash": "scrypt:32768:8:1$WhPZxnvkY92xwRC9$d5e01cc07c6d203aaf92ffc98adcfeb906384902331424f6e1b7ad54df0e189d8c184f03e78699ecf7ea5a110d55c71777de327c48e24172a38adac5c5d0eed8",
+    "privileges": [
+      "generate",
+      "schedule"
+    ]
+  }
+}

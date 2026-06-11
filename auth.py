@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re
 import secrets
 
 from flask import abort, jsonify, redirect, request, session
@@ -79,6 +80,25 @@ def ensure_admin() -> None:
     log.warning("Created initial admin user '%s'. CHANGE THE PASSWORD after first login.", username)
 
 
+PASSWORD_RULE = ("At least 8 characters with uppercase, lowercase, a number, "
+                 "and a special character.")
+
+
+def validate_password(pw: str) -> tuple[bool, str]:
+    pw = pw or ""
+    if len(pw) < 8:
+        return False, "Password must be at least 8 characters long."
+    if not re.search(r"[A-Z]", pw):
+        return False, "Password must contain an uppercase letter."
+    if not re.search(r"[a-z]", pw):
+        return False, "Password must contain a lowercase letter."
+    if not re.search(r"\d", pw):
+        return False, "Password must contain a number."
+    if not re.search(r"[^A-Za-z0-9]", pw):
+        return False, "Password must contain a special character."
+    return True, ""
+
+
 def list_users() -> list[dict]:
     users = _load()
     return [{"username": u, "privileges": d.get("privileges", [])}
@@ -89,6 +109,9 @@ def create_user(username: str, password: str, privileges: list[str]) -> tuple[bo
     username = (username or "").strip()
     if not username or not password:
         return False, "Username and password are required."
+    ok, msg = validate_password(password)
+    if not ok:
+        return False, msg
     users = _load()
     if username in users:
         return False, "That username already exists."
@@ -112,8 +135,9 @@ def update_privileges(username: str, privileges: list[str]) -> tuple[bool, str]:
 
 
 def set_password(username: str, password: str) -> tuple[bool, str]:
-    if not password:
-        return False, "Password is required."
+    ok, msg = validate_password(password)
+    if not ok:
+        return False, msg
     users = _load()
     if username not in users:
         return False, "No such user."
