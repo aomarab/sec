@@ -79,6 +79,28 @@ python webapp.py
 Then open **http://localhost:5000**. With Docker: `docker compose up web` and
 open the same URL. Reports are saved to `./reports/` and listed in the UI.
 
+The web UI is organised into tabs: **Generate** (on-demand briefing), **Analyze
+file**, **Schedule** (recurring emailed briefings), **History** (view / download
+HTML, PDF, Markdown / preview / delete), **Dashboard**, and **Settings**.
+
+### Analyze a threat document (upload)
+
+On the **Analyze file** tab, upload a PDF or Excel/CSV threat report (e.g. a CISA
+advisory). The agent extracts the text, pulls out indicators with regex, and the
+model produces a structured report:
+
+- **Summary of Threat**
+- **Affected Products**
+- **CVEs** (clickable, linked to NVD)
+- **Indicators of Compromise** — IPs, domains, URLs, emails, MD5/SHA1/SHA256,
+  each with a reputation lookup link (VirusTotal / AbuseIPDB). Set `VT_API_KEY`
+  in `.env` to get live VirusTotal reputation scores inline.
+- **Recommendations**
+
+Indicators are extracted deterministically (defanged forms like `1.2.3[.]4` are
+handled), so long hashes are never altered. Benign reporting/vendor domains
+(cisa.gov, fbi.gov, etc.) are filtered out of the IOC table.
+
 ### Without Docker (CLI / scheduled)
 
 ```bash

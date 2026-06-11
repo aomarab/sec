@@ -1,5 +1,7 @@
 .env
 reports/
+uploads/
+schedule.json
 __pycache__/
 *.pyc
 .venv/

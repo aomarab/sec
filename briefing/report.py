@@ -155,8 +155,9 @@ def _inline(text: str) -> str:
     return text
 
 
-def render(markdown: str) -> dict:
-    """Persist markdown + HTML; return paths and the rendered HTML."""
+def render(markdown: str, prefix: str = "briefing") -> dict:
+    """Persist markdown + HTML; return paths and the rendered HTML.
+    `prefix` distinguishes report types in the filename (briefing | analysis)."""
     os.makedirs(REPORTS_DIR, exist_ok=True)
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y%m%d-%H%M%S")
@@ -166,8 +167,8 @@ def render(markdown: str) -> dict:
     heading = next((re.sub(r"^#\s+", "", ln).strip()
                     for ln in markdown.splitlines() if ln.startswith("# ")), title)
 
-    md_path = os.path.join(REPORTS_DIR, f"briefing-{stamp}.md")
-    html_path = os.path.join(REPORTS_DIR, f"briefing-{stamp}.html")
+    md_path = os.path.join(REPORTS_DIR, f"{prefix}-{stamp}.md")
+    html_path = os.path.join(REPORTS_DIR, f"{prefix}-{stamp}.html")
 
     with open(md_path, "w", encoding="utf-8") as fh:
         fh.write(markdown)
