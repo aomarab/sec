@@ -1,0 +1,10 @@
+anthropic>=0.40.0
+openai>=1.40.0
+requests>=2.31.0
+python-dotenv>=1.0.1
+jinja2>=3.1.4
+flask>=3.0.0
+xhtml2pdf>=0.2.16
+pypdf>=4.0.0
+openpyxl>=3.1.0
+APScheduler>=3.10.4

@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "frequency": "daily",
+  "weekday": "mon",
+  "time": "07:00",
+  "email": "dasd@ss.com",
+  "region": "Global",
+  "industry": "Technology",
+  "min_cvss": "0.0",
+  "look_back_days": "7",
+  "insights": "10",
+  "asset_keywords": "",
+  "presets": [],
+  "extra_instructions_free": "",
+  "extra_instructions": "",
+  "last_run": null,
+  "last_status": null
+}

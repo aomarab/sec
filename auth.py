@@ -26,6 +26,7 @@ SECRET_FILE = os.getenv("FLASK_SECRET_FILE", ".flask_secret")
 PRIVILEGES = [
     ("generate", "Generate briefings"),
     ("analyze", "Analyze files"),
+    ("scan", "Scan networks"),
     ("schedule", "Manage email schedule"),
     ("delete", "Delete history"),
     ("admin", "Administer users"),

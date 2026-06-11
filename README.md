@@ -83,6 +83,43 @@ The web UI is organised into tabs: **Generate** (on-demand briefing), **Analyze
 file**, **Schedule** (recurring emailed briefings), **History** (view / download
 HTML, PDF, Markdown / preview / delete), **Dashboard**, and **Settings**.
 
+### Network vulnerability scan
+
+The **Network scan** tab (requires the *Scan networks* privilege) discovers open
+ports/services on an authorized target and correlates detected service versions
+with known CVEs.
+
+- **Basic** — fast threaded TCP connect scan of common ports with banner grab.
+- **Advanced** — custom port ranges, banner/version detection, CVE correlation
+  (NVD + CISA KEV), nmap timing, and — if `nmap` is installed on the host —
+  service/version detection (`-sV`), OS detection (`-O`), and vuln NSE scripts
+  (`--script vuln`).
+
+Targets accept a host, IP, or CIDR (capped at 256 hosts). An **authorization
+checkbox is required** before each scan — only scan systems you own or are
+explicitly authorized to test. CVEs are *potential* matches (grounded in NVD),
+labelled for verification. The pure-Python scanner needs no extra packages;
+`nmap` is an optional external tool.
+
+### Assets, scheduled scans & alerts
+
+- **Asset inventory** — every scan upserts discovered hosts (IP, hostname, OS,
+  open ports, per-host risk, last scan) into an **Assets** tab.
+- **Scheduled scans** — set a recurring scan of a target (daily/weekly/monthly,
+  UTC) from the Network scan tab; reports land in History automatically.
+- **Alerts** — admins configure (in Settings) email + Microsoft Teams + Slack +
+  generic-webhook notifications that fire when a scan's findings meet a severity
+  threshold (KEV CVEs always trigger). Includes a "Send test alert" button.
+
+### Reports, exports & dashboard
+
+Every report (briefing, analysis, scan) can be downloaded as **HTML, PDF,
+Markdown, CSV, or Excel** from the History tab — CSV/Excel are built from the
+report's tables (one Excel sheet per table). Network scans compute a **risk
+score (0–100)** and severity breakdown, surfaced on the **Dashboard** ("Latest
+network scan — risk"). Advanced scans can be written in a **Technical** (detailed)
+or **Executive** (business-impact) report style.
+
 ### Login & user management
 
 The web app requires sign-in. On first run an admin account is created from

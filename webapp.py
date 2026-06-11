@@ -21,12 +21,15 @@ from flask import (Flask, abort, jsonify, redirect, render_template_string,
                    request, send_file, session)
 from werkzeug.utils import secure_filename
 
+import alerts
 import auth
 from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
 from analysis.extract import SUPPORTED as ALLOWED_EXT
-from briefing import delivery, report
+from briefing import delivery, export, report
 from config import CONFIG
+from scan import scanner as scan_scanner
+from scan.assess import run_scan
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -191,6 +194,135 @@ def _remove_owners(filenames):
                 json.dump(owners, fh, indent=2)
 
 
+SCAN_STATS_FILE = os.getenv("SCAN_STATS_FILE", "scan_stats.json")
+
+
+def _load_scan_stats():
+    try:
+        with open(SCAN_STATS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _set_scan_stats(filename, stats):
+    with _LOCK:
+        data = _load_scan_stats()
+        data[filename] = stats
+        with open(SCAN_STATS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+
+
+def _latest_scan_stats():
+    data = _load_scan_stats()
+    scans = sorted(glob.glob(os.path.join(report.REPORTS_DIR, "scan-*.html")),
+                   key=os.path.getmtime, reverse=True)
+    for p in scans:
+        st = data.get(os.path.basename(p))
+        if st:
+            return st
+    return None
+
+
+# ── asset inventory ──────────────────────────────────────────────────────────
+ASSETS_FILE = os.getenv("ASSETS_FILE", "assets.json")
+
+
+def _load_assets():
+    try:
+        with open(ASSETS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _upsert_assets(assets):
+    with _LOCK:
+        data = _load_assets()
+        for a in assets:
+            data[a["ip"]] = a
+        with open(ASSETS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+
+
+def _list_assets():
+    return sorted(_load_assets().values(), key=lambda a: a.get("risk", 0), reverse=True)
+
+
+# ── scheduled scans ──────────────────────────────────────────────────────────
+SCAN_SCHED_FILE = os.getenv("SCAN_SCHED_FILE", "scan_schedule.json")
+_SCAN_JOB_ID = "network_scan"
+
+
+def _load_scan_sched():
+    try:
+        with open(SCAN_SCHED_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_scan_sched(data):
+    with open(SCAN_SCHED_FILE, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+
+
+def _register_scan_sched(sched):
+    if _SCHED.get_job(_SCAN_JOB_ID):
+        _SCHED.remove_job(_SCAN_JOB_ID)
+    if not sched.get("enabled"):
+        return
+    hour, minute = (sched.get("time") or "03:00").split(":")
+    kwargs = {"hour": int(hour), "minute": int(minute)}
+    if sched.get("frequency") == "weekly":
+        kwargs["day_of_week"] = sched.get("weekday", "mon")
+    elif sched.get("frequency") == "monthly":
+        kwargs["day"] = "1"
+    _SCHED.add_job(_scheduled_scan_run, CronTrigger(timezone="UTC", **kwargs), id=_SCAN_JOB_ID)
+    log.info("Network scan schedule registered: %s", kwargs)
+
+
+def _next_scan_run():
+    job = _SCHED.get_job(_SCAN_JOB_ID)
+    return job.next_run_time.strftime("%Y-%m-%d %H:%M UTC") if job and job.next_run_time else None
+
+
+def _do_scan(opts, owner):
+    """Run a scan, persist report + stats + assets, and fire alerts. Shared by
+    the on-demand job and the scheduler."""
+    result = run_scan(opts, CONFIG)
+    out = report.render(result["markdown"], prefix="scan")
+    fname = os.path.basename(out["html_path"])
+    _set_owner(fname, owner)
+    _set_scan_stats(fname, result["stats"])
+    _upsert_assets(result.get("assets", []))
+    try:
+        alerts.dispatch(result["stats"], opts["target"], fname)
+    except Exception:
+        log.exception("Alert dispatch failed")
+    return out, result
+
+
+def _scheduled_scan_run():
+    sched = _load_scan_sched()
+    if not sched or not sched.get("enabled") or not sched.get("target"):
+        return
+    log.info("Running scheduled network scan of %s", sched["target"])
+    opts = {"target": sched["target"], "mode": sched.get("mode", "advanced"),
+            "ports": sched.get("ports", ""), "grab_banner": True, "correlate_cves": True,
+            "use_nmap": bool(sched.get("use_nmap")), "vuln_scripts": bool(sched.get("vuln_scripts")),
+            "os_detect": bool(sched.get("os_detect")), "timing": sched.get("timing", "4"),
+            "report_style": sched.get("report_style", "technical")}
+    try:
+        _do_scan(opts, "scheduler")
+        sched["last_run"] = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        sched["last_status"] = "ok"
+    except Exception:
+        sched["last_status"] = "error"
+        log.exception("Scheduled scan failed")
+    _save_scan_sched(sched)
+
+
 def _list_reports():
     paths = sorted(glob.glob(os.path.join(report.REPORTS_DIR, "*.html")),
                    key=os.path.getmtime, reverse=True)
@@ -198,7 +330,12 @@ def _list_reports():
     out = []
     for p in paths:
         name = os.path.basename(p)
-        kind = "analysis" if name.startswith("analysis-") else "briefing"
+        if name.startswith("analysis-"):
+            kind = "analysis"
+        elif name.startswith("scan-"):
+            kind = "scan"
+        else:
+            kind = "briefing"
         out.append({"filename": name, "kind": kind, "owner": owners.get(name, "")})
     return out
 
@@ -375,6 +512,11 @@ def index():
         password_rule=auth.PASSWORD_RULE,
         regions=_with_current(REGIONS, CONFIG.region, _load_schedule().get("region")),
         industries=_with_current(INDUSTRIES, CONFIG.industry, _load_schedule().get("industry")),
+        nmap_ok=scan_scanner.nmap_available(),
+        scan_stats=_latest_scan_stats(),
+        assets=_list_assets() if "scan" in perms else [],
+        scan_sched=_load_scan_sched(), next_scan_run=_next_scan_run(),
+        alert_cfg=alerts.load_config() if auth.has_perm(user, "admin") else {},
     )
 
 
@@ -512,6 +654,154 @@ def analyze():
     return jsonify({"job_id": job_id})
 
 
+def _run_scan_job(job_id, opts, email_to, owner):
+    job = JOBS[job_id]
+    handler = _ListHandler(job["logs"])
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        out, result = _do_scan(opts, owner)
+        fname = os.path.basename(out["html_path"])
+        emailed = False
+        if email_to:
+            mail_cfg = copy.deepcopy(CONFIG.email)
+            mail_cfg.enabled = True
+            mail_cfg.to = email_to
+            emailed = delivery.send_email(
+                mail_cfg, subject=out["title"], html_body=out["html"], markdown_body=result["markdown"])
+        job["report"] = {"title": out["title"], "filename": fname,
+                         "emailed": emailed, "owner": owner}
+        job["status"] = "done"
+        log.info("Scan report ready: %s", out["title"])
+    except Exception as err:
+        job["status"] = "error"
+        job["error"] = str(err)
+        log.exception("Scan job failed")
+    finally:
+        root.removeHandler(handler)
+
+
+@app.route("/scan", methods=["POST"])
+@auth.require_perm("scan")
+def scan_route():
+    f = request.form
+    if f.get("authorized") != "on":
+        return jsonify({"error": "You must confirm you are authorized to scan this target."}), 400
+    target = (f.get("target") or "").strip()
+    if not target:
+        return jsonify({"error": "Enter a target host, IP, or CIDR range."}), 400
+    try:
+        scan_scanner.expand_targets(target)
+    except Exception as err:
+        return jsonify({"error": str(err)}), 400
+    advanced = f.get("mode") == "advanced"
+    opts = {
+        "target": target,
+        "mode": "advanced" if advanced else "basic",
+        "ports": (f.get("ports") or "").strip() if advanced else "",
+        "grab_banner": (f.get("grab_banner") == "on") if advanced else True,
+        "correlate_cves": (f.get("correlate_cves") == "on") if advanced else True,
+        "use_nmap": (f.get("use_nmap") == "on") if advanced else False,
+        "vuln_scripts": (f.get("vuln_scripts") == "on") if advanced else False,
+        "os_detect": (f.get("os_detect") == "on") if advanced else False,
+        "timing": f.get("timing", "4") if advanced else "4",
+        "report_style": f.get("report_style", "technical") if advanced else "technical",
+    }
+    owner = auth.current_user()["username"]
+    email_to = (f.get("email") or "").strip() or None
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    threading.Thread(target=_run_scan_job, args=(job_id, opts, email_to, owner), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/scan/schedule", methods=["POST"])
+@auth.require_perm("scan")
+def save_scan_schedule():
+    f = request.form
+    target = (f.get("target") or "").strip()
+    if f.get("enabled") == "on" and target:
+        try:
+            scan_scanner.expand_targets(target)
+        except Exception as err:
+            return jsonify({"ok": False, "message": str(err)})
+    prev = _load_scan_sched()
+    sched = {
+        "enabled": f.get("enabled") == "on",
+        "target": target,
+        "frequency": f.get("frequency", "weekly"),
+        "weekday": f.get("weekday", "mon"),
+        "time": f.get("time", "03:00"),
+        "mode": f.get("mode", "advanced"),
+        "ports": (f.get("ports") or "").strip(),
+        "use_nmap": f.get("use_nmap") == "on",
+        "vuln_scripts": f.get("vuln_scripts") == "on",
+        "report_style": f.get("report_style", "technical"),
+        "last_run": prev.get("last_run"),
+        "last_status": prev.get("last_status"),
+    }
+    _save_scan_sched(sched)
+    _register_scan_sched(sched)
+    return jsonify({"ok": True, "enabled": sched["enabled"], "next_run": _next_scan_run()})
+
+
+@app.route("/assets")
+@auth.require_perm("scan")
+def assets_list():
+    return jsonify({"assets": _list_assets()})
+
+
+@app.route("/assets/clear", methods=["POST"])
+@auth.require_perm("scan")
+def assets_clear():
+    with _LOCK:
+        try:
+            os.remove(ASSETS_FILE)
+        except OSError:
+            pass
+    return jsonify({"ok": True})
+
+
+@app.route("/alerts", methods=["GET"])
+@auth.require_perm("admin")
+def alerts_get():
+    return jsonify(alerts.load_config())
+
+
+@app.route("/alerts/save", methods=["POST"])
+@auth.require_perm("admin")
+def alerts_save():
+    f = request.form
+    cfg = {
+        "enabled": f.get("enabled") == "on",
+        "min_severity": f.get("min_severity", "high"),
+        "email_to": (f.get("email_to") or "").strip(),
+        "teams_webhook": (f.get("teams_webhook") or "").strip(),
+        "slack_webhook": (f.get("slack_webhook") or "").strip(),
+        "webhook_url": (f.get("webhook_url") or "").strip(),
+    }
+    alerts.save_config(cfg)
+    return jsonify({"ok": True})
+
+
+@app.route("/alerts/test", methods=["POST"])
+@auth.require_perm("admin")
+def alerts_test():
+    f = request.form
+    cfg = {"enabled": True, "min_severity": f.get("min_severity", "high"),
+           "email_to": (f.get("email_to") or "").strip(),
+           "teams_webhook": (f.get("teams_webhook") or "").strip(),
+           "slack_webhook": (f.get("slack_webhook") or "").strip(),
+           "webhook_url": (f.get("webhook_url") or "").strip()}
+    result = alerts.send_test(cfg)
+    msg = ("Sent via: " + ", ".join(result["sent"])) if result["sent"] else "No channels sent."
+    if result["errors"]:
+        msg += " · errors: " + "; ".join(result["errors"])
+    return jsonify({"ok": bool(result["sent"]), "message": msg})
+
+
 @app.route("/status/<job_id>")
 @auth.login_required
 def status(job_id):
@@ -606,6 +896,19 @@ def download_report(filename):
             abort(404)
         return send_file(os.path.abspath(md_path), as_attachment=True,
                          download_name=stem + ".md")
+
+    if fmt in ("csv", "xlsx"):
+        if not os.path.isfile(md_path):
+            abort(404)
+        with open(md_path, encoding="utf-8") as fh:
+            tables = export.extract_tables(fh.read())
+        if fmt == "csv":
+            return send_file(io.BytesIO(export.to_csv(tables).encode("utf-8-sig")),
+                             mimetype="text/csv", as_attachment=True,
+                             download_name=stem + ".csv")
+        return send_file(io.BytesIO(export.to_xlsx_bytes(tables)),
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         as_attachment=True, download_name=stem + ".xlsx")
 
     if not os.path.isfile(html_path):
         abort(404)
@@ -734,6 +1037,8 @@ _PAGE = """<!DOCTYPE html>
   .stat { background:#f7f9fb; border:1px solid var(--line); border-radius:10px; padding:14px; }
   .stat .n { font-size:22px; font-weight:700; color:var(--navy); }
   .stat .l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-top:4px; }
+  .risk-critical { color:#b42318; } .risk-high { color:#c2410c; } .risk-medium { color:#a16207; }
+  .risk-low { color:#166534; } .risk-minimal { color:#166534; }
   .badge { font-size:11px; padding:2px 8px; border-radius:999px; }
   .badge.on { background:#dcfce7; color:#166534; } .badge.off { background:#f3f4f6; color:#6b7280; }
   .console { background:#0b1622; color:#cfe3f7; font-family:Consolas,monospace; font-size:12px; border-radius:8px; padding:14px; height:240px; overflow:auto; white-space:pre-wrap; display:none; margin-top:14px; }
@@ -749,6 +1054,7 @@ _PAGE = """<!DOCTYPE html>
   .kind { font-size:10px; padding:2px 7px; border-radius:999px; font-weight:600; flex-shrink:0; letter-spacing:.02em; text-transform:uppercase; }
   .kind.briefing { background:#dbeafe; color:#1e40af; }
   .kind.analysis { background:#ede9fe; color:#6d28d9; }
+  .kind.scan { background:#ccfbf1; color:#0f766e; }
   .by { color:#6b7280; font-size:12px; white-space:nowrap; }
   .ms { position:relative; }
   .ms-toggle { width:100%; margin-top:0; text-align:left; background:#fff; color:#1f2328; border:1px solid var(--line); padding:9px 10px; border-radius:6px; font-size:14px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px; }
@@ -768,18 +1074,27 @@ _PAGE = """<!DOCTYPE html>
   #clear-btn { background:#b42318; font-size:13px; padding:8px 14px; }
   #search { margin-bottom:12px; }
   #preview { width:100%; height:520px; border:1px solid var(--line); border-radius:8px; margin-top:14px; display:none; background:#fff; }
-  @media (max-width:680px) {
+  /* Wide app tables (assets, users) scroll horizontally instead of breaking layout */
+  .card table { max-width:100%; }
+  @media (max-width:760px) {
     .wrap { padding:0 10px; margin:16px auto; }
     .grid3 { grid-template-columns:1fr; }
     .stats { grid-template-columns:1fr 1fr; }
     .tabbar .wrapbar { overflow-x:auto; flex-wrap:nowrap; -webkit-overflow-scrolling:touch; }
     .tabbtn { padding:12px 12px; font-size:13px; white-space:nowrap; }
-    header { padding:16px; } header h1 { font-size:17px; }
+    header { padding:14px 16px; }
+    header h1 { font-size:16px; }
+    header .hwrap { flex-wrap:wrap; gap:6px; }
+    header .huser { font-size:12px; }
     .card { padding:16px; }
-    ul.reports li .name { flex:1 1 100%; }
-    .actions { flex:1 1 100%; }
+    .card table { display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
+    ul.reports li { flex-direction:column; align-items:flex-start; }
+    ul.reports li .name { flex:1 1 100%; width:100%; }
+    .actions { flex:1 1 100%; flex-wrap:wrap; }
+    .console { height:200px; }
     #preview { height:420px; }
     input, select, textarea { font-size:16px; }
+    .presets { gap:10px 14px; }
   }
 </style></head>
 <body>
@@ -798,6 +1113,8 @@ _PAGE = """<!DOCTYPE html>
 <nav class="tabbar"><div class="wrapbar">
   {% if 'generate' in perms %}<button class="tabbtn {{ 'active' if active_tab=='tab-generate' }}" data-tab="tab-generate">Generate</button>{% endif %}
   {% if 'analyze' in perms %}<button class="tabbtn" data-tab="tab-analyze">Analyze file</button>{% endif %}
+  {% if 'scan' in perms %}<button class="tabbtn" data-tab="tab-scan">Network scan</button>{% endif %}
+  {% if 'scan' in perms %}<button class="tabbtn" data-tab="tab-assets">Assets</button>{% endif %}
   {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
   <button class="tabbtn {{ 'active' if active_tab=='tab-history' }}" data-tab="tab-history">History</button>
   <button class="tabbtn" data-tab="tab-dashboard">Dashboard</button>
@@ -817,6 +1134,18 @@ _PAGE = """<!DOCTYPE html>
     </div>
     <div class="note">Engine: {{ provider }}{% if model %} &middot; {{ model }}{% endif %}{% if stats.when %} &middot; latest briefing {{ stats.when }}{% endif %}{% if schedule.last_run %} &middot; last scheduled run {{ schedule.last_run }} ({{ schedule.last_status }}){% endif %}</div>
   </div>
+  {% if scan_stats %}
+  <div class="card">
+    <h2>Latest network scan — risk</h2>
+    <div class="stats">
+      <div class="stat"><div class="n risk-{{ scan_stats.label|lower }}">{{ scan_stats.risk }}/100</div><div class="l">Risk · {{ scan_stats.label }}</div></div>
+      <div class="stat"><div class="n risk-critical">{{ scan_stats.counts.critical }}</div><div class="l">Critical</div></div>
+      <div class="stat"><div class="n risk-high">{{ scan_stats.counts.high }}</div><div class="l">High</div></div>
+      <div class="stat"><div class="n risk-medium">{{ scan_stats.counts.medium }}</div><div class="l">Medium</div></div>
+    </div>
+    <div class="note">Target {{ scan_stats.target }} &middot; {{ scan_stats.hosts_up }} responsive host(s) &middot; {{ scan_stats.open_ports }} open ports &middot; {{ scan_stats.cves }} potential CVEs ({{ scan_stats.kev }} in CISA KEV)</div>
+  </div>
+  {% endif %}
   </section>
 
   {% if 'generate' in perms %}
@@ -868,6 +1197,101 @@ _PAGE = """<!DOCTYPE html>
       <span id="a-state" class="pill" style="display:none"></span>
     </form>
     <div id="a-console" class="console"></div>
+  </div>
+  </section>
+  {% endif %}
+
+  {% if 'scan' in perms %}
+  <section class="tab" id="tab-scan">
+  <div class="card">
+    <h2>Scan a network for vulnerabilities</h2>
+    <p class="note">Discovers open ports and services, then correlates detected versions with known CVEs (from NVD/KEV). Results are saved to History.</p>
+    <div class="warn">Only scan systems you own or are explicitly authorized to test. Unauthorized scanning may be illegal.</div>
+    <form id="scan-form">
+      <div class="grid3">
+        <div><label>Target (host, IP, or CIDR)</label><input name="target" placeholder="192.168.1.10 or 10.0.0.0/28 or host.example.com"></div>
+        <div><label>Mode</label>
+          <select name="mode" id="scan-mode">
+            <option value="basic">Basic — common ports, fast</option>
+            <option value="advanced">Advanced — custom ports, CVE correlation, nmap</option>
+          </select>
+        </div>
+        <div><label>Email result to (optional)</label><input name="email" placeholder="you@company.com"></div>
+      </div>
+      <div id="scan-adv" style="display:none">
+        <div class="grid3" style="margin-top:6px">
+          <div><label>Ports (e.g. 1-1024 or 22,80,443) — blank = common set</label><input name="ports" placeholder="1-1024"></div>
+          <div><label>nmap timing (0 slow – 5 fast)</label>
+            <select name="timing"><option>3</option><option selected>4</option><option>5</option><option>2</option><option>1</option><option>0</option></select>
+          </div>
+          <div><label>Report style</label>
+            <select name="report_style"><option value="technical">Technical (detailed)</option><option value="executive">Executive (business)</option></select>
+          </div>
+        </div>
+        <div class="row"><label>Options</label>
+          <div class="presets">
+            <label><input type="checkbox" name="grab_banner" checked> Banner / version detection</label>
+            <label><input type="checkbox" name="correlate_cves" checked> Correlate CVEs (NVD/KEV)</label>
+            <label><input type="checkbox" name="use_nmap"> Use nmap if installed {% if not nmap_ok %}(not detected){% endif %}</label>
+            <label><input type="checkbox" name="vuln_scripts"> nmap vuln scripts</label>
+            <label><input type="checkbox" name="os_detect"> OS detection (nmap)</label>
+          </div>
+          {% if not nmap_ok %}<div class="note">nmap isn't installed on the server, so nmap options are ignored — the built-in scanner is used. Install nmap for service/version detection and vuln scripts.</div>{% endif %}
+        </div>
+      </div>
+      <div class="check"><input type="checkbox" id="scan-auth" name="authorized"><label for="scan-auth" style="margin:0">I am authorized to scan this target.</label></div>
+      <button id="scan-btn" type="submit">Start scan</button>
+      <span id="s-state" class="pill" style="display:none"></span>
+    </form>
+    <div id="s-console" class="console"></div>
+  </div>
+  <div class="card">
+    <h2>Scheduled scans</h2>
+    <p class="note">Recurring scan of a target; alerts fire on findings (configure in Settings). Runs only while the app is running; times are UTC.</p>
+    <form id="scan-sched-form">
+      <div class="check"><input type="checkbox" id="ss-enabled" name="enabled" {% if scan_sched.enabled %}checked{% endif %}><label for="ss-enabled" style="margin:0">Enable scheduled scan</label></div>
+      <div class="grid3" style="margin-top:12px">
+        <div><label>Target (host/IP/CIDR)</label><input name="target" value="{{ scan_sched.target or '' }}" placeholder="10.0.0.0/28"></div>
+        <div><label>Frequency</label><select name="frequency"><option value="daily" {% if scan_sched.frequency=='daily' %}selected{% endif %}>Daily</option><option value="weekly" {% if scan_sched.frequency not in ['daily','monthly'] %}selected{% endif %}>Weekly</option><option value="monthly" {% if scan_sched.frequency=='monthly' %}selected{% endif %}>Monthly (1st)</option></select></div>
+        <div><label>Time (UTC)</label><input name="time" type="time" value="{{ scan_sched.time or '03:00' }}"></div>
+        <div><label>Day of week (weekly)</label><select name="weekday">{% for d in ['mon','tue','wed','thu','fri','sat','sun'] %}<option value="{{ d }}" {% if scan_sched.weekday==d %}selected{% endif %}>{{ d|capitalize }}</option>{% endfor %}</select></div>
+        <div><label>Mode</label><select name="mode"><option value="basic" {% if scan_sched.mode=='basic' %}selected{% endif %}>Basic</option><option value="advanced" {% if scan_sched.mode!='basic' %}selected{% endif %}>Advanced</option></select></div>
+        <div><label>Ports (advanced)</label><input name="ports" value="{{ scan_sched.ports or '' }}" placeholder="1-1024"></div>
+      </div>
+      <div class="presets" style="margin-top:10px">
+        <label><input type="checkbox" name="use_nmap" {% if scan_sched.use_nmap %}checked{% endif %}> Use nmap</label>
+        <label><input type="checkbox" name="vuln_scripts" {% if scan_sched.vuln_scripts %}checked{% endif %}> nmap vuln scripts</label>
+      </div>
+      <button type="submit">Save scheduled scan</button>
+      <span id="ss-state" class="pill">{% if next_scan_run %}Next run: {{ next_scan_run }}{% else %}Not scheduled{% endif %}{% if scan_sched.last_run %} · last: {{ scan_sched.last_run }} ({{ scan_sched.last_status }}){% endif %}</span>
+    </form>
+  </div>
+  </section>
+  {% endif %}
+
+  {% if 'scan' in perms %}
+  <section class="tab" id="tab-assets">
+  <div class="card">
+    <h2>Asset inventory</h2>
+    <p class="note">Hosts discovered by scans with their highest observed risk — updated automatically after each scan.</p>
+    {% if assets %}
+    <table style="width:100%;border-collapse:collapse;margin-top:8px">
+      <tr style="text-align:left;border-bottom:2px solid #e2e5e9"><th style="padding:8px">IP</th><th style="padding:8px">Hostname</th><th style="padding:8px">OS</th><th style="padding:8px">Open ports</th><th style="padding:8px">Risk</th><th style="padding:8px">Last scan</th></tr>
+      {% for a in assets %}
+      <tr style="border-bottom:1px solid #eef1f4">
+        <td style="padding:8px;font-weight:600">{{ a.ip }}</td>
+        <td style="padding:8px">{{ a.hostname or '—' }}</td>
+        <td style="padding:8px">{{ a.os or '—' }}</td>
+        <td style="padding:8px">{{ a.ports|length }}{% if a.services %} ({{ a.services|join(', ') }}){% endif %}</td>
+        <td style="padding:8px"><span class="risk-{{ a.label|lower }}" style="font-weight:600">{{ a.risk }} · {{ a.label }}</span></td>
+        <td style="padding:8px;color:#6b7280">{{ a.last_scan }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <button id="assets-clear" type="button" class="secondary" style="margin-top:12px">Clear inventory</button>
+    {% else %}
+    <p style="color:#6b7280">No assets yet — run a network scan.</p>
+    {% endif %}
   </div>
   </section>
   {% endif %}
@@ -929,12 +1353,14 @@ _PAGE = """<!DOCTYPE html>
     <ul class="reports" id="report-list">
       {% for r in reports %}
         <li data-file="{{ r.filename }}">
-          <span class="name"><span class="kind {{ r.kind }}">{{ 'Analysis' if r.kind == 'analysis' else 'Briefing' }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
+          <span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','briefing':'Briefing'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
           <span class="actions">
             <button class="pv" type="button" data-file="{{ r.filename }}">Preview</button>
             <a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a>
             <a class="dl" href="/download/{{ r.filename }}?fmt=pdf">PDF</a>
             <a class="dl" href="/download/{{ r.filename }}?fmt=md">MD</a>
+            <a class="dl" href="/download/{{ r.filename }}?fmt=csv">CSV</a>
+            <a class="dl" href="/download/{{ r.filename }}?fmt=xlsx">XLSX</a>
             <button class="del" type="button" data-file="{{ r.filename }}">Delete</button>
           </span>
         </li>
@@ -978,6 +1404,26 @@ _PAGE = """<!DOCTYPE html>
         {% if logo %}<button id="logo-del" type="button" class="secondary" style="margin-left:8px">Remove logo</button>{% endif %}
         <span id="logo-state" class="pill" style="display:none"></span>
       </div>
+    </form>
+  </div>
+  {% endif %}
+  {% if is_admin %}
+  <div class="card">
+    <h2>Alerts</h2>
+    <p class="note">Notify when a scan's findings meet the severity threshold. Webhook URLs come from Teams/Slack "Incoming Webhook" connectors.</p>
+    <form id="alerts-form">
+      <div class="check"><input type="checkbox" id="al-en" name="enabled" {% if alert_cfg.enabled %}checked{% endif %}><label for="al-en" style="margin:0">Enable alerts</label></div>
+      <div class="grid3" style="margin-top:12px">
+        <div><label>Trigger at severity</label><select name="min_severity">{% for s in ['critical','high','medium','low'] %}<option value="{{ s }}" {% if alert_cfg.min_severity==s %}selected{% endif %}>{{ s|capitalize }} and above</option>{% endfor %}</select></div>
+        <div><label>Email to (comma-separated)</label><input name="email_to" value="{{ alert_cfg.email_to or '' }}"></div>
+        <div></div>
+        <div><label>Microsoft Teams webhook</label><input name="teams_webhook" value="{{ alert_cfg.teams_webhook or '' }}" placeholder="https://outlook.office.com/webhook/..."></div>
+        <div><label>Slack webhook</label><input name="slack_webhook" value="{{ alert_cfg.slack_webhook or '' }}" placeholder="https://hooks.slack.com/services/..."></div>
+        <div><label>Generic webhook (JSON POST)</label><input name="webhook_url" value="{{ alert_cfg.webhook_url or '' }}"></div>
+      </div>
+      <button type="submit">Save alerts</button>
+      <button id="al-test" type="button" class="secondary" style="margin-left:8px">Send test alert</button>
+      <span id="al-state" class="pill" style="display:none"></span>
     </form>
   </div>
   {% endif %}
@@ -1091,8 +1537,8 @@ if (stopBtn) stopBtn.addEventListener('click', async () => {
 });
 
 function rowHtml(f, owner) {
-  const kind = f.indexOf('analysis-') === 0 ? 'analysis' : 'briefing';
-  const label = kind === 'analysis' ? 'Analysis' : 'Briefing';
+  const kind = f.indexOf('analysis-') === 0 ? 'analysis' : (f.indexOf('scan-') === 0 ? 'scan' : 'briefing');
+  const label = kind === 'analysis' ? 'Analysis' : (kind === 'scan' ? 'Scan' : 'Briefing');
   const by = owner ? '<span class="by">by ' + owner + '</span>' : '';
   return '<span class="name"><span class="kind ' + kind + '">' + label + '</span>' +
          '<a href="/reports/' + f + '" target="_blank">' + f + '</a>' + by + '</span>' +
@@ -1101,6 +1547,8 @@ function rowHtml(f, owner) {
          '<a class="dl" href="/download/' + f + '?fmt=html">HTML</a>' +
          '<a class="dl" href="/download/' + f + '?fmt=pdf">PDF</a>' +
          '<a class="dl" href="/download/' + f + '?fmt=md">MD</a>' +
+         '<a class="dl" href="/download/' + f + '?fmt=csv">CSV</a>' +
+         '<a class="dl" href="/download/' + f + '?fmt=xlsx">XLSX</a>' +
          '<button class="del" type="button" data-file="' + f + '">Delete</button></span>';
 }
 function addReportRow(f, owner) {
@@ -1242,6 +1690,82 @@ async function pollAnalyze(jobId) {
   }
 }
 
+// network scan
+const scanForm = document.getElementById('scan-form');
+if (scanForm) {
+  const scanMode = document.getElementById('scan-mode');
+  const scanAdv = document.getElementById('scan-adv');
+  const syncMode = () => { scanAdv.style.display = scanMode.value === 'advanced' ? 'block' : 'none'; };
+  scanMode.addEventListener('change', syncMode); syncMode();
+  const sbtn = document.getElementById('scan-btn');
+  const scon = document.getElementById('s-console');
+  const sstate2 = document.getElementById('s-state');
+  scanForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!document.getElementById('scan-auth').checked) { alert('Please confirm you are authorized to scan this target.'); return; }
+    sbtn.disabled = true; scon.style.display = 'block'; scon.textContent = '';
+    sstate2.style.display = 'inline'; sstate2.textContent = 'scanning...'; sstate2.className = 'pill';
+    const res = await fetch('/scan', { method:'POST', body: new FormData(scanForm) });
+    if (!res.ok) { let m='scan failed'; try { m=(await res.json()).error||m; } catch(e){} sstate2.textContent='error'; sstate2.className='pill err'; scon.textContent=m; sbtn.disabled=false; return; }
+    pollScan((await res.json()).job_id);
+  });
+  async function pollScan(jobId) {
+    try {
+      const job = await (await fetch('/status/' + jobId)).json();
+      scon.textContent = (job.logs || []).join('\\n'); scon.scrollTop = scon.scrollHeight;
+      if (job.status === 'running') { setTimeout(() => pollScan(jobId), 1200); return; }
+      sbtn.disabled = false;
+      if (job.status === 'done') {
+        sstate2.textContent = 'done'; sstate2.className = 'pill ok';
+        scon.textContent += '\\n\\nScan report ready: ' + job.report.title;
+        addReportRow(job.report.filename, job.report.owner);
+        window.open('/reports/' + job.report.filename, '_blank');
+      } else {
+        sstate2.textContent = 'error'; sstate2.className = 'pill err';
+        scon.textContent += '\\n\\nError: ' + (job.error || 'unknown');
+      }
+    } catch (err) {
+      sbtn.disabled = false; sstate2.textContent = 'error'; sstate2.className = 'pill err';
+      scon.textContent += '\\n\\nError: ' + err;
+    }
+  }
+}
+
+// scheduled scan
+const ssForm = document.getElementById('scan-sched-form');
+if (ssForm) ssForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const d = await (await fetch('/scan/schedule', { method:'POST', body: new FormData(ssForm) })).json();
+  const s = document.getElementById('ss-state');
+  if (d.ok) { s.textContent = (d.enabled && d.next_run) ? ('Saved · next run: ' + d.next_run) : 'Scheduled scan disabled'; s.className = 'pill ok'; }
+  else { s.textContent = d.message || 'error'; s.className = 'pill err'; }
+});
+
+// asset inventory clear
+const assetsClear = document.getElementById('assets-clear');
+if (assetsClear) assetsClear.addEventListener('click', async () => {
+  if (!confirm('Clear the asset inventory?')) return;
+  await fetch('/assets/clear', { method:'POST' });
+  location.reload();
+});
+
+// alerts config
+const alForm = document.getElementById('alerts-form');
+if (alForm) {
+  alForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await fetch('/alerts/save', { method:'POST', body: new FormData(alForm) });
+    const s = document.getElementById('al-state'); s.style.display = 'inline';
+    s.textContent = 'Saved'; s.className = 'pill ok';
+  });
+  document.getElementById('al-test').addEventListener('click', async () => {
+    const s = document.getElementById('al-state'); s.style.display = 'inline';
+    s.textContent = 'sending...'; s.className = 'pill';
+    const d = await (await fetch('/alerts/test', { method:'POST', body: new FormData(alForm) })).json();
+    s.textContent = d.message; s.className = 'pill ' + (d.ok ? 'ok' : 'err');
+  });
+}
+
 // change my password
 const pwf = document.getElementById('pw-form');
 if (pwf) pwf.addEventListener('submit', async (e) => {
@@ -1330,6 +1854,9 @@ def _startup():
     saved = _load_schedule()
     if saved:
         _register_schedule(saved)
+    scan_sched = _load_scan_sched()
+    if scan_sched:
+        _register_scan_sched(scan_sched)
 
 
 if __name__ == "__main__":

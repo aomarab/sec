@@ -5,6 +5,11 @@ schedule.json
 users.json
 .flask_secret
 branding/
+report_owners.json
+scan_stats.json
+scan_schedule.json
+assets.json
+alerts.json
 __pycache__/
 *.pyc
 .venv/

@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "target": "",
+  "frequency": "weekly",
+  "weekday": "mon",
+  "time": "03:00",
+  "mode": "advanced",
+  "ports": "",
+  "use_nmap": false,
+  "vuln_scripts": false,
+  "report_style": "technical",
+  "last_run": null,
+  "last_status": null
+}
