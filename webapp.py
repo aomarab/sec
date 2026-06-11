@@ -22,6 +22,7 @@ from flask import (Flask, abort, jsonify, redirect, render_template_string,
 from werkzeug.utils import secure_filename
 
 import alerts
+import assistant
 import auth
 from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
@@ -802,6 +803,32 @@ def alerts_test():
     return jsonify({"ok": bool(result["sent"]), "message": msg})
 
 
+@app.route("/assistant", methods=["POST"])
+@auth.login_required
+def assistant_route():
+    data = request.get_json(silent=True) or {}
+    clean = []
+    for m in (data.get("messages") or [])[-20:]:
+        role, content = m.get("role"), str(m.get("content", ""))[:6000]
+        if role in ("user", "assistant") and content.strip():
+            clean.append({"role": role, "content": content})
+    if not clean or clean[-1]["role"] != "user":
+        return jsonify({"error": "No question provided."}), 400
+    context = ""
+    rep = os.path.basename(data.get("report", "") or "")
+    if rep:
+        md = os.path.join(report.REPORTS_DIR, os.path.splitext(rep)[0] + ".md")
+        if os.path.isfile(md):
+            with open(md, encoding="utf-8") as fh:
+                context = fh.read()
+    try:
+        reply = assistant.answer(clean, context, CONFIG)
+    except Exception as err:
+        log.exception("Assistant failed")
+        return jsonify({"error": f"Assistant error: {err}"}), 500
+    return jsonify({"reply": reply})
+
+
 @app.route("/status/<job_id>")
 @auth.login_required
 def status(job_id):
@@ -1074,6 +1101,10 @@ _PAGE = """<!DOCTYPE html>
   #clear-btn { background:#b42318; font-size:13px; padding:8px 14px; }
   #search { margin-bottom:12px; }
   #preview { width:100%; height:520px; border:1px solid var(--line); border-radius:8px; margin-top:14px; display:none; background:#fff; }
+  .aichat { border:1px solid var(--line); border-radius:8px; padding:12px; height:380px; overflow:auto; background:#fbfcfe; display:flex; flex-direction:column; gap:10px; margin-top:6px; }
+  .msg { max-width:88%; padding:10px 12px; border-radius:10px; font-size:14px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+  .msg.user { align-self:flex-end; background:#1d4671; color:#fff; }
+  .msg.bot { align-self:flex-start; background:#fff; border:1px solid var(--line); font-family:Consolas,Menlo,monospace; }
   /* Wide app tables (assets, users) scroll horizontally instead of breaking layout */
   .card table { max-width:100%; }
   @media (max-width:760px) {
@@ -1117,36 +1148,11 @@ _PAGE = """<!DOCTYPE html>
   {% if 'scan' in perms %}<button class="tabbtn" data-tab="tab-assets">Assets</button>{% endif %}
   {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
   <button class="tabbtn {{ 'active' if active_tab=='tab-history' }}" data-tab="tab-history">History</button>
-  <button class="tabbtn" data-tab="tab-dashboard">Dashboard</button>
+  <button class="tabbtn" data-tab="tab-assistant">AI assistant</button>
   <button class="tabbtn" data-tab="tab-settings">Settings</button>
   {% if is_admin %}<button class="tabbtn" data-tab="tab-admin">Admin</button>{% endif %}
 </div></nav>
 <div class="wrap">
-
-  <section class="tab" id="tab-dashboard">
-  <div class="card">
-    <h2>Status</h2>
-    <div class="stats">
-      <div class="stat"><div class="n">{{ stats.total }}</div><div class="l">Saved briefings</div></div>
-      <div class="stat"><div class="n">{{ stats.cves }}</div><div class="l">CVEs in latest</div></div>
-      <div class="stat"><div class="n" style="font-size:14px">{% if smtp_ready %}<span class="badge on">Ready</span>{% else %}<span class="badge off">Not set</span>{% endif %}</div><div class="l">Email (SMTP)</div></div>
-      <div class="stat"><div class="n" style="font-size:13px">{{ next_run or 'Off' }}</div><div class="l">Next scheduled run</div></div>
-    </div>
-    <div class="note">Engine: {{ provider }}{% if model %} &middot; {{ model }}{% endif %}{% if stats.when %} &middot; latest briefing {{ stats.when }}{% endif %}{% if schedule.last_run %} &middot; last scheduled run {{ schedule.last_run }} ({{ schedule.last_status }}){% endif %}</div>
-  </div>
-  {% if scan_stats %}
-  <div class="card">
-    <h2>Latest network scan — risk</h2>
-    <div class="stats">
-      <div class="stat"><div class="n risk-{{ scan_stats.label|lower }}">{{ scan_stats.risk }}/100</div><div class="l">Risk · {{ scan_stats.label }}</div></div>
-      <div class="stat"><div class="n risk-critical">{{ scan_stats.counts.critical }}</div><div class="l">Critical</div></div>
-      <div class="stat"><div class="n risk-high">{{ scan_stats.counts.high }}</div><div class="l">High</div></div>
-      <div class="stat"><div class="n risk-medium">{{ scan_stats.counts.medium }}</div><div class="l">Medium</div></div>
-    </div>
-    <div class="note">Target {{ scan_stats.target }} &middot; {{ scan_stats.hosts_up }} responsive host(s) &middot; {{ scan_stats.open_ports }} open ports &middot; {{ scan_stats.cves }} potential CVEs ({{ scan_stats.kev }} in CISA KEV)</div>
-  </div>
-  {% endif %}
-  </section>
 
   {% if 'generate' in perms %}
   <section class="tab {{ 'active' if active_tab=='tab-generate' }}" id="tab-generate">
@@ -1373,7 +1379,49 @@ _PAGE = """<!DOCTYPE html>
   </div>
   </section>
 
+  <section class="tab" id="tab-assistant">
+  <div class="card">
+    <h2>AI security assistant</h2>
+    <p class="note">Ask about vulnerabilities, business impact, or remediation. Optionally ground the chat in one of your reports, then ask "explain the risks" or "write a script to fix this".</p>
+    <div class="grid3">
+      <div><label>Ground in report (optional)</label>
+        <select id="ai-report"><option value="">None — general questions</option>
+          {% for r in reports %}<option value="{{ r.filename }}">{{ r.filename }}</option>{% endfor %}
+        </select>
+      </div>
+    </div>
+    <div id="ai-chat" class="aichat"></div>
+    <form id="ai-form" style="display:flex; gap:8px; margin-top:10px">
+      <input id="ai-input" placeholder="e.g. How do I remediate CVE-2021-34527 on Windows?" style="flex:1">
+      <button id="ai-send" type="submit" style="margin-top:0">Send</button>
+    </form>
+    <div class="note">Try: "Explain the risks in this scan" · "Generate a PowerShell script to disable SMBv1" · "What's the business impact?"</div>
+  </div>
+  </section>
+
   <section class="tab" id="tab-settings">
+  <div class="card">
+    <h2>Status</h2>
+    <div class="stats">
+      <div class="stat"><div class="n">{{ stats.total }}</div><div class="l">Saved briefings</div></div>
+      <div class="stat"><div class="n">{{ stats.cves }}</div><div class="l">CVEs in latest</div></div>
+      <div class="stat"><div class="n" style="font-size:14px">{% if smtp_ready %}<span class="badge on">Ready</span>{% else %}<span class="badge off">Not set</span>{% endif %}</div><div class="l">Email (SMTP)</div></div>
+      <div class="stat"><div class="n" style="font-size:13px">{{ next_run or 'Off' }}</div><div class="l">Next scheduled run</div></div>
+    </div>
+    <div class="note">Engine: {{ provider }}{% if model %} &middot; {{ model }}{% endif %}{% if stats.when %} &middot; latest briefing {{ stats.when }}{% endif %}{% if schedule.last_run %} &middot; last scheduled run {{ schedule.last_run }} ({{ schedule.last_status }}){% endif %}</div>
+  </div>
+  {% if scan_stats %}
+  <div class="card">
+    <h2>Latest network scan — risk</h2>
+    <div class="stats">
+      <div class="stat"><div class="n risk-{{ scan_stats.label|lower }}">{{ scan_stats.risk }}/100</div><div class="l">Risk · {{ scan_stats.label }}</div></div>
+      <div class="stat"><div class="n risk-critical">{{ scan_stats.counts.critical }}</div><div class="l">Critical</div></div>
+      <div class="stat"><div class="n risk-high">{{ scan_stats.counts.high }}</div><div class="l">High</div></div>
+      <div class="stat"><div class="n risk-medium">{{ scan_stats.counts.medium }}</div><div class="l">Medium</div></div>
+    </div>
+    <div class="note">Target {{ scan_stats.target }} &middot; {{ scan_stats.hosts_up }} responsive host(s) &middot; {{ scan_stats.open_ports }} open ports &middot; {{ scan_stats.cves }} potential CVEs ({{ scan_stats.kev }} in CISA KEV)</div>
+  </div>
+  {% endif %}
   <div class="card">
     <h2>Settings</h2>
     <p class="note">These come from your <code>.env</code> file and are shown for reference. Edit <code>.env</code> and restart the app to change them.</p>
@@ -1729,6 +1777,45 @@ if (scanForm) {
       scon.textContent += '\\n\\nError: ' + err;
     }
   }
+}
+
+// AI assistant chat
+const aiForm = document.getElementById('ai-form');
+if (aiForm) {
+  const chat = document.getElementById('ai-chat');
+  const input = document.getElementById('ai-input');
+  const sendBtn = document.getElementById('ai-send');
+  const reportSel = document.getElementById('ai-report');
+  let history = [];
+  function bubble(role, text) {
+    const d = document.createElement('div');
+    d.className = 'msg ' + (role === 'user' ? 'user' : 'bot');
+    d.textContent = text;
+    chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
+    return d;
+  }
+  aiForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const q = input.value.trim();
+    if (!q) return;
+    input.value = ''; sendBtn.disabled = true;
+    bubble('user', q);
+    history.push({ role: 'user', content: q });
+    if (history.length > 20) history = history.slice(-20);
+    const pending = bubble('bot', '…');
+    try {
+      const res = await fetch('/assistant', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history, report: reportSel.value })
+      });
+      const d = await res.json();
+      pending.textContent = d.reply || d.error || '(no response)';
+      if (d.reply) history.push({ role: 'assistant', content: d.reply });
+    } catch (err) {
+      pending.textContent = 'Error: ' + err;
+    }
+    sendBtn.disabled = false; input.focus();
+  });
 }
 
 // scheduled scan

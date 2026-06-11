@@ -101,6 +101,14 @@ explicitly authorized to test. CVEs are *potential* matches (grounded in NVD),
 labelled for verification. The pure-Python scanner needs no extra packages;
 `nmap` is an optional external tool.
 
+### AI security assistant
+
+The **AI assistant** tab is a chat that answers security questions — "why is this
+vulnerable?", "how do I remediate CVE-X?", "what's the business impact?" — and
+generates remediation as PowerShell / Bash / Azure CLI. Optionally **ground the
+chat in one of your reports** (a scan or analysis) so answers reference its actual
+findings, hosts, and CVEs instead of generic advice.
+
 ### Assets, scheduled scans & alerts
 
 - **Asset inventory** — every scan upserts discovered hosts (IP, hostname, OS,
