@@ -1,0 +1,32 @@
+services:
+  threat-intel-agent:
+    build: .
+    image: threat-intel-briefing-agent:latest
+    container_name: threat-intel-briefing-agent
+    env_file:
+      - .env
+    environment:
+      # Override here if you prefer compose over .env; .env wins if both set.
+      RUN_MODE: ${RUN_MODE:-schedule}
+    volumes:
+      - ./reports:/app/reports
+    restart: unless-stopped
+    # Lets the container reach a local Ollama on the host (LLM_PROVIDER=ollama)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Browser UI — `docker compose up web`, then open http://localhost:5000
+  web:
+    build: .
+    image: threat-intel-briefing-agent:latest
+    container_name: threat-intel-briefing-web
+    command: ["python", "webapp.py"]
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./reports:/app/reports
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
