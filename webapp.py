@@ -19,8 +19,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import (Flask, abort, jsonify, render_template_string, request,
                    send_file)
+from werkzeug.utils import secure_filename
 
 from agent.loop import Cancelled, run_agent
+from analysis.analyze import analyze_document
+from analysis.extract import SUPPORTED as ALLOWED_EXT
 from briefing import delivery, report
 from config import CONFIG
 
@@ -33,6 +36,7 @@ JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 
 SCHEDULE_FILE = os.getenv("SCHEDULE_FILE", "schedule.json")
+UPLOADS_DIR = os.getenv("UPLOADS_DIR", "uploads")
 _SCHED = BackgroundScheduler(timezone="UTC")
 _JOB_ID = "email_briefing"
 
@@ -117,7 +121,12 @@ def _generate(cfg, email_to=None, cancel_event=None) -> dict:
 def _list_reports():
     paths = sorted(glob.glob(os.path.join(report.REPORTS_DIR, "*.html")),
                    key=os.path.getmtime, reverse=True)
-    return [{"filename": os.path.basename(p)} for p in paths]
+    out = []
+    for p in paths:
+        name = os.path.basename(p)
+        kind = "analysis" if name.startswith("analysis-") else "briefing"
+        out.append({"filename": name, "kind": kind})
+    return out
 
 
 def _smtp_ready():
@@ -236,6 +245,65 @@ def run():
         JOBS[job_id] = {"status": "running", "logs": [], "report": None,
                         "error": None, "cancel": cancel}
     threading.Thread(target=_run_job, args=(job_id, cfg, email_to, cancel), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+def _run_analyze_job(job_id, paths, email_to):
+    job = JOBS[job_id]
+    handler = _ListHandler(job["logs"])
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        reports = []
+        for p in paths:
+            markdown = analyze_document(p, CONFIG)
+            out = report.render(markdown, prefix="analysis")
+            emailed = False
+            if email_to:
+                mail_cfg = copy.deepcopy(CONFIG.email)
+                mail_cfg.enabled = True
+                mail_cfg.to = email_to
+                emailed = delivery.send_email(
+                    mail_cfg, subject=out["title"], html_body=out["html"], markdown_body=markdown,
+                )
+            reports.append({"title": out["title"],
+                            "filename": os.path.basename(out["html_path"]),
+                            "emailed": emailed})
+            log.info("Analysis ready: %s", out["title"])
+        job["reports"] = reports
+        job["report"] = reports[-1] if reports else None
+        job["status"] = "done"
+    except Exception as err:
+        job["status"] = "error"
+        job["error"] = str(err)
+        log.exception("Analysis job failed")
+    finally:
+        root.removeHandler(handler)
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    files = [f for f in request.files.getlist("files") if f and f.filename]
+    if not files:
+        return jsonify({"error": "No file uploaded."}), 400
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    paths = []
+    for f in files:
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in ALLOWED_EXT:
+            return jsonify({"error": f"Unsupported file type '{ext}'. "
+                            f"Allowed: {', '.join(sorted(ALLOWED_EXT))}"}), 400
+        safe = secure_filename(f.filename) or ("upload" + ext)
+        dest = os.path.join(UPLOADS_DIR, uuid.uuid4().hex[:8] + "_" + safe)
+        f.save(dest)
+        paths.append(dest)
+    email_to = (request.form.get("email") or "").strip() or None
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        JOBS[job_id] = {"status": "running", "logs": [], "report": None,
+                        "reports": None, "error": None}
+    threading.Thread(target=_run_analyze_job, args=(job_id, paths, email_to), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
@@ -423,11 +491,15 @@ _PAGE = """<!DOCTYPE html>
   .note { font-size:12px; color:var(--muted); margin-top:8px; }
   .warn { background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; font-size:12px; padding:8px 10px; border-radius:6px; margin-top:10px; }
   ul.reports { list-style:none; margin:0; padding:0; }
-  ul.reports li { padding:10px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  ul.reports li { padding:10px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
   ul.reports li:last-child { border-bottom:0; }
-  ul.reports li .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  ul.reports li .name { display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto; }
+  ul.reports li .name a { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .kind { font-size:10px; padding:2px 7px; border-radius:999px; font-weight:600; flex-shrink:0; letter-spacing:.02em; text-transform:uppercase; }
+  .kind.briefing { background:#dbeafe; color:#1e40af; }
+  .kind.analysis { background:#ede9fe; color:#6d28d9; }
   a { color:#1f6feb; text-decoration:none; } a:hover { text-decoration:underline; }
-  .actions { display:flex; gap:6px; align-items:center; flex-shrink:0; }
+  .actions { display:flex; gap:6px; align-items:center; flex-shrink:0; flex-wrap:wrap; }
   .dl, .pv { font-size:12px; border:1px solid var(--line); padding:4px 9px; border-radius:6px; color:#1f6feb; cursor:pointer; background:#fff; }
   .dl:hover, .pv:hover { background:#f4f8ff; text-decoration:none; }
   .del { background:#fff; color:#b42318; border:1px solid #f3c0b8; padding:4px 9px; border-radius:6px; font-size:12px; cursor:pointer; margin:0; }
@@ -436,11 +508,25 @@ _PAGE = """<!DOCTYPE html>
   #clear-btn { background:#b42318; font-size:13px; padding:8px 14px; }
   #search { margin-bottom:12px; }
   #preview { width:100%; height:520px; border:1px solid var(--line); border-radius:8px; margin-top:14px; display:none; background:#fff; }
+  @media (max-width:680px) {
+    .wrap { padding:0 10px; margin:16px auto; }
+    .grid3 { grid-template-columns:1fr; }
+    .stats { grid-template-columns:1fr 1fr; }
+    .tabbar .wrapbar { overflow-x:auto; flex-wrap:nowrap; -webkit-overflow-scrolling:touch; }
+    .tabbtn { padding:12px 12px; font-size:13px; white-space:nowrap; }
+    header { padding:16px; } header h1 { font-size:17px; }
+    .card { padding:16px; }
+    ul.reports li .name { flex:1 1 100%; }
+    .actions { flex:1 1 100%; }
+    #preview { height:420px; }
+    input, select, textarea { font-size:16px; }
+  }
 </style></head>
 <body>
 <header><h1>Threat Intelligence Briefing Agent</h1></header>
 <nav class="tabbar"><div class="wrapbar">
   <button class="tabbtn active" data-tab="tab-generate">Generate</button>
+  <button class="tabbtn" data-tab="tab-analyze">Analyze file</button>
   <button class="tabbtn" data-tab="tab-schedule">Schedule</button>
   <button class="tabbtn" data-tab="tab-history">History</button>
   <button class="tabbtn" data-tab="tab-dashboard">Dashboard</button>
@@ -491,6 +577,22 @@ _PAGE = """<!DOCTYPE html>
       <span id="state" class="pill" style="display:none"></span>
     </form>
     <div id="console" class="console"></div>
+  </div>
+  </section>
+
+  <section class="tab" id="tab-analyze">
+  <div class="card">
+    <h2>Analyze a threat document</h2>
+    <p class="note">Upload a PDF or Excel/CSV threat report. You'll get a structured summary: threat overview, affected products, CVEs, an indicator (IOC) table with reputation lookups, and recommendations.</p>
+    <form id="analyze-form">
+      <div class="row"><label>File(s) — PDF, XLSX, CSV, TXT</label>
+        <input id="analyze-files" name="files" type="file" multiple accept=".pdf,.xlsx,.xlsm,.csv,.tsv,.txt,.md,.json,.log"></div>
+      <div class="row"><label>Email the result to (optional, comma-separated)</label>
+        <input name="email" placeholder="you@company.com"></div>
+      <button id="analyze-btn" type="submit">Analyze</button>
+      <span id="a-state" class="pill" style="display:none"></span>
+    </form>
+    <div id="a-console" class="console"></div>
   </div>
   </section>
 
@@ -549,7 +651,7 @@ _PAGE = """<!DOCTYPE html>
     <ul class="reports" id="report-list">
       {% for r in reports %}
         <li data-file="{{ r.filename }}">
-          <span class="name"><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a></span>
+          <span class="name"><span class="kind {{ r.kind }}">{{ 'Analysis' if r.kind == 'analysis' else 'Briefing' }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a></span>
           <span class="actions">
             <button class="pv" type="button" data-file="{{ r.filename }}">Preview</button>
             <a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a>
@@ -629,7 +731,10 @@ stopBtn.addEventListener('click', async () => {
 });
 
 function rowHtml(f) {
-  return '<span class="name"><a href="/reports/' + f + '" target="_blank">' + f + '</a></span>' +
+  const kind = f.indexOf('analysis-') === 0 ? 'analysis' : 'briefing';
+  const label = kind === 'analysis' ? 'Analysis' : 'Briefing';
+  return '<span class="name"><span class="kind ' + kind + '">' + label + '</span>' +
+         '<a href="/reports/' + f + '" target="_blank">' + f + '</a></span>' +
          '<span class="actions">' +
          '<button class="pv" type="button" data-file="' + f + '">Preview</button>' +
          '<a class="dl" href="/download/' + f + '?fmt=html">HTML</a>' +
@@ -735,6 +840,46 @@ document.getElementById('test-btn').addEventListener('click', async () => {
   sstate.textContent = data.ok ? 'Test email sent' : ('Test failed: ' + data.error);
   sstate.className = data.ok ? 'pill ok' : 'pill err';
 });
+
+// analyze file upload
+const aform = document.getElementById('analyze-form');
+const abtn = document.getElementById('analyze-btn');
+const acon = document.getElementById('a-console');
+const astate = document.getElementById('a-state');
+aform.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!document.getElementById('analyze-files').files.length) { alert('Choose a file to analyze.'); return; }
+  abtn.disabled = true; acon.style.display = 'block'; acon.textContent = '';
+  astate.style.display = 'inline'; astate.textContent = 'analyzing...'; astate.className = 'pill';
+  const res = await fetch('/analyze', { method:'POST', body: new FormData(aform) });
+  if (!res.ok) {
+    let msg = 'upload failed'; try { msg = (await res.json()).error || msg; } catch (e) {}
+    astate.textContent = 'error'; astate.className = 'pill err'; acon.textContent = msg; abtn.disabled = false; return;
+  }
+  pollAnalyze((await res.json()).job_id);
+});
+async function pollAnalyze(jobId) {
+  try {
+    const r = await fetch('/status/' + jobId);
+    const job = await r.json();
+    acon.textContent = (job.logs || []).join('\\n'); acon.scrollTop = acon.scrollHeight;
+    if (job.status === 'running') { setTimeout(() => pollAnalyze(jobId), 1200); return; }
+    abtn.disabled = false;
+    if (job.status === 'done') {
+      const reps = job.reports || (job.report ? [job.report] : []);
+      astate.textContent = 'done (' + reps.length + ')'; astate.className = 'pill ok';
+      acon.textContent += '\\n\\nAnalysis complete: ' + reps.length + ' report(s).';
+      reps.forEach(rp => addReportRow(rp.filename));
+      if (reps[0]) window.open('/reports/' + reps[0].filename, '_blank');
+    } else {
+      astate.textContent = 'error'; astate.className = 'pill err';
+      acon.textContent += '\\n\\nError: ' + (job.error || 'unknown');
+    }
+  } catch (err) {
+    abtn.disabled = false; astate.textContent = 'error'; astate.className = 'pill err';
+    acon.textContent += '\\n\\nError: ' + err;
+  }
+}
 </script>
 </body></html>"""
 
