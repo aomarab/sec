@@ -387,7 +387,15 @@ _PAGE = """<!DOCTYPE html>
   body { margin:0; font-family:'Segoe UI',-apple-system,Arial,sans-serif; background:#eef1f5; color:#1f2328; }
   header { background:linear-gradient(135deg,#0f2a43,#1d4671); color:#fff; padding:20px 28px; }
   header h1 { margin:0; font-size:20px; }
-  .wrap { max-width:960px; margin:24px auto; padding:0 16px; display:grid; gap:20px; }
+  .tabbar { background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
+  .tabbar .wrapbar { max-width:960px; margin:0 auto; display:flex; gap:2px; padding:0 16px; flex-wrap:wrap; }
+  .tabbtn { background:none; border:0; padding:14px 16px; margin:0; color:var(--muted); font-size:14px; cursor:pointer; border-bottom:3px solid transparent; border-radius:0; }
+  .tabbtn:hover { color:var(--navy); }
+  .tabbtn.active { color:var(--navy); font-weight:600; border-bottom-color:var(--accent); }
+  .tab { display:none; }
+  .tab.active { display:flex; flex-direction:column; gap:20px; }
+  input[readonly] { background:#f7f9fb; color:#6b7280; cursor:default; }
+  .wrap { max-width:960px; margin:24px auto; padding:0 16px; }
   .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px 22px; }
   .card h2 { margin:0 0 14px; font-size:15px; color:var(--navy); }
   .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
@@ -431,8 +439,16 @@ _PAGE = """<!DOCTYPE html>
 </style></head>
 <body>
 <header><h1>Threat Intelligence Briefing Agent</h1></header>
+<nav class="tabbar"><div class="wrapbar">
+  <button class="tabbtn active" data-tab="tab-generate">Generate</button>
+  <button class="tabbtn" data-tab="tab-schedule">Schedule</button>
+  <button class="tabbtn" data-tab="tab-history">History</button>
+  <button class="tabbtn" data-tab="tab-dashboard">Dashboard</button>
+  <button class="tabbtn" data-tab="tab-settings">Settings</button>
+</div></nav>
 <div class="wrap">
 
+  <section class="tab" id="tab-dashboard">
   <div class="card">
     <h2>Status</h2>
     <div class="stats">
@@ -443,7 +459,9 @@ _PAGE = """<!DOCTYPE html>
     </div>
     <div class="note">Engine: {{ provider }}{% if model %} &middot; {{ model }}{% endif %}{% if stats.when %} &middot; latest briefing {{ stats.when }}{% endif %}{% if schedule.last_run %} &middot; last scheduled run {{ schedule.last_run }} ({{ schedule.last_status }}){% endif %}</div>
   </div>
+  </section>
 
+  <section class="tab active" id="tab-generate">
   <div class="card">
     <h2>Generate a briefing</h2>
     <form id="run-form">
@@ -474,7 +492,9 @@ _PAGE = """<!DOCTYPE html>
     </form>
     <div id="console" class="console"></div>
   </div>
+  </section>
 
+  <section class="tab" id="tab-schedule">
   <div class="card">
     <h2>Email schedule</h2>
     {% if not smtp_ready %}<div class="warn">SMTP isn't configured. Set SMTP_HOST, EMAIL_FROM (and login) in your .env, or scheduled briefings are generated but not emailed.</div>{% endif %}
@@ -520,7 +540,9 @@ _PAGE = """<!DOCTYPE html>
     </form>
     <div class="note">Times are UTC. The schedule runs only while this app is running.</div>
   </div>
+  </section>
 
+  <section class="tab" id="tab-history">
   <div class="card">
     <h2>Past briefings</h2>
     <input id="search" type="search" placeholder="Filter briefings by name...">
@@ -543,8 +565,38 @@ _PAGE = """<!DOCTYPE html>
     {% if reports %}<button id="clear-btn" type="button">Clear all history</button>{% endif %}
     <iframe id="preview" title="Briefing preview"></iframe>
   </div>
+  </section>
+
+  <section class="tab" id="tab-settings">
+  <div class="card">
+    <h2>Settings</h2>
+    <p class="note">These come from your <code>.env</code> file and are shown for reference. Edit <code>.env</code> and restart the app to change them.</p>
+    <div class="grid3" style="margin-top:14px">
+      <div><label>LLM provider</label><input value="{{ provider }}" readonly></div>
+      <div><label>Model</label><input value="{{ model or 'n/a' }}" readonly></div>
+      <div><label>Email configured</label><input value="{{ 'Yes' if smtp_ready else 'No' }}" readonly></div>
+      <div><label>Default region</label><input value="{{ cfg.region }}" readonly></div>
+      <div><label>Default industry</label><input value="{{ cfg.industry }}" readonly></div>
+      <div><label>Default min severity (CVSS)</label><input value="{{ cfg.min_cvss }}" readonly></div>
+      <div><label>Default look-back (days)</label><input value="{{ cfg.look_back_days }}" readonly></div>
+      <div><label>Default insights</label><input value="{{ cfg.insights_to_research }}" readonly></div>
+      <div><label>Max agent steps</label><input value="{{ cfg.max_steps }}" readonly></div>
+      <div><label>SMTP host</label><input value="{{ cfg.email.smtp_host or 'not set' }}" readonly></div>
+      <div><label>Email from</label><input value="{{ cfg.email.sender or 'not set' }}" readonly></div>
+      <div><label>SMTP port</label><input value="{{ cfg.email.smtp_port }}" readonly></div>
+    </div>
+  </div>
+  </section>
 
 </div>
+<script>
+document.querySelectorAll('.tabbtn').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.tabbtn').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  document.getElementById(b.dataset.tab).classList.add('active');
+}));
+</script>
 <script>
 const freq = document.getElementById('freq');
 const wdWrap = document.getElementById('weekday-wrap');
