@@ -82,6 +82,41 @@ def search_by_keyword(keyword: str, min_cvss: float = 7.0, limit: int = 8,
     return {"source": "NVD", "keyword": keyword, "count": len(out), "cves": out[:limit]}
 
 
+def fetch_cve(cve_id: str, api_key: str = "") -> dict | None:
+    """Fetch a single CVE record by ID. Returns description, CVSS, severity,
+    vector, affected products (from CPE), references, and status — or None if
+    the CVE isn't found."""
+    headers = {"apiKey": api_key} if api_key else None
+    data = get_json(NVD_API, params={"cveId": cve_id}, headers=headers, timeout=40)
+    items = data.get("vulnerabilities", [])
+    if not items:
+        return None
+    cve = items[0].get("cve", {})
+    score, severity, vector = _best_cvss(cve.get("metrics", {}))
+    descs = cve.get("descriptions", [])
+    desc = next((d["value"] for d in descs if d.get("lang") == "en"), "")
+    refs = [r.get("url") for r in cve.get("references", []) if r.get("url")]
+    products: set[str] = set()
+    for conf in cve.get("configurations", []):
+        for node in conf.get("nodes", []):
+            for m in node.get("cpeMatch", []):
+                parts = m.get("criteria", "").split(":")
+                if len(parts) > 5 and parts[3] != "*":
+                    products.add(f"{parts[3]} {parts[4]}".replace("_", " ").strip())
+    return {
+        "cve": cve.get("id"),
+        "published": cve.get("published"),
+        "last_modified": cve.get("lastModified"),
+        "status": cve.get("vulnStatus", ""),
+        "cvss": score,
+        "severity": severity,
+        "vector": vector,
+        "description": desc,
+        "products": sorted(products)[:30],
+        "references": refs[:15],
+    }
+
+
 def _best_cvss(metrics: dict) -> tuple[float | None, str | None, str | None]:
     for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
         entries = metrics.get(key)

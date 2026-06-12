@@ -28,6 +28,7 @@ from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
 from analysis.extract import SUPPORTED as ALLOWED_EXT
 from analysis import vendor as vendor_analysis
+from intel import analyst
 from briefing import delivery, export, report
 from config import CONFIG
 from scan import scanner as scan_scanner
@@ -339,6 +340,12 @@ def _list_reports():
             kind = "scan"
         elif name.startswith("recon-"):
             kind = "recon"
+        elif name.startswith("cve-"):
+            kind = "cve"
+        elif name.startswith("actor-"):
+            kind = "actor"
+        elif name.startswith("hunt-"):
+            kind = "hunt"
         else:
             kind = "briefing"
         out.append({"filename": name, "kind": kind, "owner": owners.get(name, "")})
@@ -683,6 +690,57 @@ def vendor_analyze():
         log.exception("Vendor analysis failed")
         return jsonify({"error": f"Analysis error: {err}"}), 500
     return jsonify(result)
+
+
+def _save_intel(markdown, prefix, owner):
+    out = report.render(markdown, prefix=prefix)
+    fname = os.path.basename(out["html_path"])
+    _set_owner(fname, owner)
+    heading = next((ln[2:].strip() for ln in markdown.splitlines() if ln.startswith("# ")), out["title"])
+    return {"ok": True, "filename": fname, "title": heading, "owner": owner}
+
+
+@app.route("/cve-analyze", methods=["POST"])
+@auth.require_perm("generate")
+def cve_analyze():
+    cve_id = (request.form.get("cve") or "").strip()
+    try:
+        md = analyst.analyze_cve(cve_id, CONFIG)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    except Exception as err:
+        log.exception("CVE analysis failed")
+        return jsonify({"error": str(err)}), 500
+    return jsonify(_save_intel(md, "cve", auth.current_user()["username"]))
+
+
+@app.route("/actor-profile", methods=["POST"])
+@auth.require_perm("generate")
+def actor_profile():
+    name = (request.form.get("name") or "").strip()
+    try:
+        md = analyst.profile_actor(name, CONFIG)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    except Exception as err:
+        log.exception("Actor profile failed")
+        return jsonify({"error": str(err)}), 500
+    return jsonify(_save_intel(md, "actor", auth.current_user()["username"]))
+
+
+@app.route("/hunt-generate", methods=["POST"])
+@auth.require_perm("generate")
+def hunt_generate():
+    subject = (request.form.get("subject") or "").strip()
+    platform = (request.form.get("platform") or "sentinel").strip()
+    try:
+        md = analyst.hunt_queries(subject, platform, CONFIG)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    except Exception as err:
+        log.exception("Hunt generation failed")
+        return jsonify({"error": str(err)}), 500
+    return jsonify(_save_intel(md, "hunt", auth.current_user()["username"]))
 
 
 def _run_scan_job(job_id, opts, email_to, owner):
@@ -1157,9 +1215,19 @@ _PAGE = """<!DOCTYPE html>
   .tabbtn.active { background:rgba(59,130,246,.16); color:#fff; box-shadow:inset 2px 0 0 var(--primary); }
   .content { flex:1; min-width:0; display:flex; flex-direction:column; }
   .topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; background:rgba(15,23,42,.85); backdrop-filter:blur(8px); }
-  .topbar h1 { margin:0; font-size:15px; font-weight:600; color:#fff; }
+  .topbar h1 { margin:0; font-size:15px; font-weight:600; color:#fff; display:flex; align-items:center; gap:10px; min-width:0; }
+  .topbar h1 { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .topbar-logo { height:26px; max-width:120px; border-radius:4px; background:#fff; padding:2px; flex-shrink:0; }
   .topbar .huser { font-size:13px; color:var(--muted); display:flex; gap:12px; align-items:center; white-space:nowrap; }
   .topbar .huser a { color:var(--primary); }
+  .menu-toggle { display:none; background:transparent; border:1px solid var(--line); color:var(--text); font-size:18px; line-height:1; padding:7px 11px; border-radius:8px; cursor:pointer; margin:0; flex-shrink:0; }
+  .menu-toggle:hover { background:rgba(148,163,184,.10); }
+  .scrim { display:none; }
+  .acc-head { cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:10px; user-select:none; }
+  .acc-arrow { color:var(--muted); font-size:13px; transition:transform .2s; flex-shrink:0; }
+  .card.collapsed .acc-arrow { transform:rotate(-90deg); }
+  .card.collapsed .acc-body { display:none; }
+  .card.collapsed h2 { margin-bottom:0; }
   .wrap { max-width:1200px; width:100%; margin:0 auto; padding:24px; }
   .tab { display:none; }
   .tab.active { display:flex; flex-direction:column; gap:20px; }
@@ -1205,6 +1273,9 @@ _PAGE = """<!DOCTYPE html>
   .kind.analysis { background:rgba(139,92,246,.18); color:#c4b5fd; }
   .kind.scan { background:rgba(20,184,166,.20); color:#5eead4; }
   .kind.recon { background:rgba(245,158,11,.18); color:#fcd34d; }
+  .kind.cve { background:rgba(239,68,68,.18); color:#fca5a5; }
+  .kind.actor { background:rgba(168,85,247,.20); color:#d8b4fe; }
+  .kind.hunt { background:rgba(16,185,129,.18); color:#6ee7b7; }
   .by { color:var(--muted); font-size:12px; white-space:nowrap; }
   .ms { position:relative; }
   .ms-toggle { width:100%; margin-top:0; text-align:left; background:var(--field); color:var(--text); border:1px solid var(--line); padding:9px 10px; border-radius:6px; font-size:14px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px; }
@@ -1242,11 +1313,13 @@ _PAGE = """<!DOCTYPE html>
   .ai-body #ai-input { flex:1; }
   .ai-body #ai-send { margin-top:0; }
   @media (max-width:860px) {
-    .app { flex-direction:column; }
-    .sidebar { width:100%; height:auto; position:sticky; top:0; flex-direction:row; overflow-x:auto; gap:4px; border-right:0; border-bottom:1px solid var(--line); -webkit-overflow-scrolling:touch; z-index:30; }
-    .sidebar .brand, .sidebar .nav-group { display:none; }
+    .menu-toggle { display:flex; }
+    .sidebar { position:fixed; top:0; left:0; height:100vh; width:248px; flex-direction:column;
+               transform:translateX(-100%); transition:transform .22s ease; z-index:60; overflow:auto;
+               border-right:1px solid var(--line); }
+    .sidebar.open { transform:translateX(0); box-shadow:6px 0 28px rgba(0,0,0,.5); }
+    .scrim.open { display:block; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:55; }
     .tabbtn { white-space:nowrap; }
-    .tabbtn.active { box-shadow:inset 0 -2px 0 var(--primary); }
     .topbar { padding:12px 16px; }
     .topbar h1 { font-size:14px; }
     .wrap { padding:16px; }
@@ -1277,7 +1350,8 @@ _PAGE = """<!DOCTYPE html>
   <div class="brand">{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" style="height:24px;border-radius:4px;background:#fff;padding:2px;">{% else %}<span class="dot"></span>{% endif %}Threat Intel</div>
   {% if 'generate' in perms or 'analyze' in perms %}<div class="nav-group">Intelligence</div>{% endif %}
   {% if 'generate' in perms %}<button class="tabbtn {{ 'active' if active_tab=='tab-generate' }}" data-tab="tab-generate">Briefings</button>{% endif %}
-  {% if 'analyze' in perms %}<button class="tabbtn" data-tab="tab-analyze">File Analysis</button>{% endif %}
+  {% if 'analyze' in perms %}<button class="tabbtn" data-tab="tab-analyze">Analyze</button>{% endif %}
+  {% if 'generate' in perms %}<button class="tabbtn" data-tab="tab-intel">Threat Intel</button>{% endif %}
   {% if 'scan' in perms %}<div class="nav-group">Attack Surface</div>
   <button class="tabbtn" data-tab="tab-scan">Network Scan</button>
   <button class="tabbtn" data-tab="tab-recon">OSINT Recon</button>
@@ -1289,9 +1363,11 @@ _PAGE = """<!DOCTYPE html>
   <button class="tabbtn" data-tab="tab-settings">Settings</button>
   {% if is_admin %}<button class="tabbtn" data-tab="tab-admin">Admin</button>{% endif %}
 </aside>
+<div id="nav-scrim" class="scrim"></div>
 <div class="content">
 <header class="topbar">
-  <h1>Threat Intelligence Briefing Agent</h1>
+  <button id="menu-toggle" class="menu-toggle" type="button" aria-label="Open menu">&#9776;</button>
+  <h1>{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" class="topbar-logo">{% endif %}Threat Intelligence Briefing Agent</h1>
   <div class="huser">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
 </header>
 <div class="wrap">
@@ -1361,6 +1437,50 @@ _PAGE = """<!DOCTYPE html>
       <span id="v-state" class="pill" style="display:none"></span>
     </form>
     <div id="vendor-result" style="margin-top:14px"></div>
+  </div>
+  </section>
+  {% endif %}
+
+  {% if 'generate' in perms %}
+  <section class="tab" id="tab-intel">
+  <div class="card">
+    <h2>CVE analysis</h2>
+    <p class="note">Enter a CVE ID for a grounded deep-dive — live CVSS (NVD), exploitation probability (EPSS), CISA KEV status, MITRE ATT&CK mapping, and prioritised remediation. Saved to History.</p>
+    <form id="cve-form">
+      <div class="grid3">
+        <div style="grid-column:span 2"><label>CVE ID</label><input id="cve-id" name="cve" placeholder="CVE-2024-3400"></div>
+        <div style="display:flex;align-items:flex-end"><button id="cve-btn" type="submit" style="margin:0;width:100%">Analyze CVE</button></div>
+      </div>
+      <span id="cve-state" class="pill" style="display:none"></span>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Threat actor intelligence</h2>
+    <p class="note">Profile a threat actor, APT group, or ransomware operation — aliases, TTPs mapped to MITRE ATT&CK, associated malware, target sectors, attribution confidence, and hunting starters. AI-compiled from public intel; verify recent claims before operational use.</p>
+    <form id="actor-form">
+      <div class="grid3">
+        <div style="grid-column:span 2"><label>Actor / group / malware name</label><input id="actor-name" name="name" placeholder="LockBit · APT29 · Lazarus Group"></div>
+        <div style="display:flex;align-items:flex-end"><button id="actor-btn" type="submit" style="margin:0;width:100%">Build profile</button></div>
+      </div>
+      <span id="actor-state" class="pill" style="display:none"></span>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Threat hunting queries</h2>
+    <p class="note">Generate hunting queries plus an investigation workflow for a threat or technique, in your platform's language. Queries are AI-generated starting points — validate table/field names against your environment before use.</p>
+    <form id="hunt-form">
+      <div class="grid3">
+        <div><label>Hunt for</label><input id="hunt-subject" name="subject" placeholder="LockBit ransomware · T1059 PowerShell"></div>
+        <div><label>Platform</label><select name="platform">
+          <option value="sentinel">Microsoft Sentinel (KQL)</option>
+          <option value="defender">Microsoft Defender XDR (KQL)</option>
+          <option value="splunk">Splunk (SPL)</option>
+          <option value="sigma">Sigma (YAML)</option>
+        </select></div>
+        <div style="display:flex;align-items:flex-end"><button id="hunt-btn" type="submit" style="margin:0;width:100%">Generate queries</button></div>
+      </div>
+      <span id="hunt-state" class="pill" style="display:none"></span>
+    </form>
   </div>
   </section>
   {% endif %}
@@ -1556,7 +1676,7 @@ _PAGE = """<!DOCTYPE html>
     <ul class="reports" id="report-list">
       {% for r in reports %}
         <li data-file="{{ r.filename }}">
-          <span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
+          <span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing','cve':'CVE','actor':'Actor','hunt':'Hunt'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
           <span class="actions">
             <button class="pv" type="button" data-file="{{ r.filename }}">Preview</button>
             <a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a>
@@ -1713,12 +1833,38 @@ const _fetch = window.fetch;
 window.fetch = async (...a) => { const r = await _fetch(...a); if (r.status === 401) { location.href = '/login'; } return r; };
 </script>
 <script>
+// mobile slide-out menu
+const sidebarEl = document.querySelector('.sidebar');
+const navScrim = document.getElementById('nav-scrim');
+const menuToggle = document.getElementById('menu-toggle');
+function closeNav() { if (sidebarEl) sidebarEl.classList.remove('open'); if (navScrim) navScrim.classList.remove('open'); }
+if (menuToggle && sidebarEl) menuToggle.addEventListener('click', () => {
+  const open = sidebarEl.classList.toggle('open');
+  if (navScrim) navScrim.classList.toggle('open', open);
+});
+if (navScrim) navScrim.addEventListener('click', closeNav);
+
 document.querySelectorAll('.tabbtn').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('.tabbtn').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
   document.getElementById(b.dataset.tab).classList.add('active');
+  closeNav();
 }));
+
+// Settings: collapsible sections (accordion)
+document.querySelectorAll('#tab-settings > .card').forEach((card, i) => {
+  const h = card.querySelector('h2');
+  if (!h) return;
+  const body = document.createElement('div');
+  body.className = 'acc-body';
+  while (h.nextSibling) body.appendChild(h.nextSibling);
+  card.appendChild(body);
+  h.classList.add('acc-head');
+  h.insertAdjacentHTML('beforeend', '<span class="acc-arrow">&#9662;</span>');
+  if (i !== 0) card.classList.add('collapsed');
+  h.addEventListener('click', () => card.classList.toggle('collapsed'));
+});
 
 // checkbox dropdowns (multi-select)
 document.querySelectorAll('.ms').forEach(ms => {
@@ -1786,8 +1932,10 @@ if (stopBtn) stopBtn.addEventListener('click', async () => {
 });
 
 function rowHtml(f, owner) {
-  const kind = f.indexOf('analysis-') === 0 ? 'analysis' : (f.indexOf('scan-') === 0 ? 'scan' : (f.indexOf('recon-') === 0 ? 'recon' : 'briefing'));
-  const label = kind === 'analysis' ? 'Analysis' : (kind === 'scan' ? 'Scan' : (kind === 'recon' ? 'Recon' : 'Briefing'));
+  const KINDS = [['analysis-','analysis','Analysis'],['scan-','scan','Scan'],['recon-','recon','Recon'],
+                 ['cve-','cve','CVE'],['actor-','actor','Actor'],['hunt-','hunt','Hunt']];
+  const m = KINDS.find(k => f.indexOf(k[0]) === 0) || ['','briefing','Briefing'];
+  const kind = m[1], label = m[2];
   const by = owner ? '<span class="by">by ' + owner + '</span>' : '';
   return '<span class="name"><span class="kind ' + kind + '">' + label + '</span>' +
          '<a href="/reports/' + f + '" target="_blank">' + f + '</a>' + by + '</span>' +
@@ -1998,6 +2146,31 @@ if (vform) {
     vbtn.disabled = false;
   });
 }
+
+// threat intel: CVE analysis / actor profile / hunt queries
+function wireIntel(formId, btnId, stateId, url, busyText) {
+  const f = document.getElementById(formId);
+  if (!f) return;
+  const btn = document.getElementById(btnId);
+  const st = document.getElementById(stateId);
+  f.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    btn.disabled = true; st.style.display = 'inline'; st.textContent = busyText; st.className = 'pill';
+    let d;
+    try {
+      const res = await fetch(url, { method:'POST', body: new FormData(f) });
+      d = await res.json();
+      if (!res.ok || !d.ok) { st.textContent = (d && d.error) ? d.error : 'error'; st.className = 'pill err'; btn.disabled = false; return; }
+    } catch (err) { st.textContent = 'Error: ' + err; st.className = 'pill err'; btn.disabled = false; return; }
+    st.textContent = 'done'; st.className = 'pill ok';
+    addReportRow(d.filename, d.owner);
+    window.open('/reports/' + d.filename, '_blank');
+    btn.disabled = false;
+  });
+}
+wireIntel('cve-form', 'cve-btn', 'cve-state', '/cve-analyze', 'analyzing…');
+wireIntel('actor-form', 'actor-btn', 'actor-state', '/actor-profile', 'profiling…');
+wireIntel('hunt-form', 'hunt-btn', 'hunt-state', '/hunt-generate', 'generating…');
 
 // network scan
 const scanForm = document.getElementById('scan-form');
