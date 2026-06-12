@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -30,6 +31,7 @@ from analysis.extract import SUPPORTED as ALLOWED_EXT
 from analysis import vendor as vendor_analysis
 from intel import analyst
 from briefing import delivery, export, report
+from collectors import kev, nvd
 from config import CONFIG
 from scan import scanner as scan_scanner
 from scan.assess import run_scan
@@ -512,7 +514,7 @@ def admin_logo_delete():
 def index():
     user = auth.current_user()
     perms = {p for p in auth.PRIV_KEYS if auth.has_perm(user, p)}
-    active_tab = "tab-generate" if "generate" in perms else "tab-history"
+    active_tab = "tab-dashboard"
     return render_template_string(
         _PAGE, cfg=CONFIG, reports=_list_reports(), provider=CONFIG.llm.provider,
         model=getattr(CONFIG.llm, f"{CONFIG.llm.provider}_model", ""),
@@ -741,6 +743,58 @@ def hunt_generate():
         log.exception("Hunt generation failed")
         return jsonify({"error": str(err)}), 500
     return jsonify(_save_intel(md, "hunt", auth.current_user()["username"]))
+
+
+# ── latest CVE feed (NVD recent + KEV flag, cached) ───────────────────────────
+_CVE_CACHE: dict = {"ts": 0.0, "items": []}
+_CVE_TTL = int(os.getenv("LATEST_CVE_TTL", "900"))  # 15 minutes
+
+
+def _fetch_latest_cves(limit: int = 30) -> list[dict]:
+    now = time.time()
+    with _LOCK:
+        if _CVE_CACHE["items"] and now - _CVE_CACHE["ts"] < _CVE_TTL:
+            return _CVE_CACHE["items"][:limit]
+    try:
+        res = nvd.fetch_recent_cves(look_back_days=7, min_cvss=0.0, limit=300)
+        cves = res.get("cves", [])
+    except Exception as err:
+        log.info("Latest-CVE NVD fetch failed: %s", err)
+        cves = []
+    try:
+        kev_ids = {v["cve"] for v in
+                   kev.fetch_kev(look_back_days=36500, limit=1000000).get("vulnerabilities", [])}
+    except Exception:
+        kev_ids = set()
+    items = []
+    for c in cves:
+        items.append({
+            "cve": c.get("cve"),
+            "cvss": c.get("cvss"),
+            "severity": c.get("severity") or "",
+            "published": (c.get("published") or "")[:10],
+            "description": (c.get("description") or "")[:240],
+            "kev": c.get("cve") in kev_ids,
+        })
+    items.sort(key=lambda x: x.get("published", ""), reverse=True)
+    if items:
+        with _LOCK:
+            _CVE_CACHE["items"] = items
+            _CVE_CACHE["ts"] = now
+    return items[:limit]
+
+
+@app.route("/api/latest-cves")
+@auth.login_required
+def api_latest_cves():
+    try:
+        limit = max(1, min(int(request.args.get("limit", 30)), 100))
+    except (TypeError, ValueError):
+        limit = 30
+    items = _fetch_latest_cves(limit)
+    return jsonify({"cves": items, "count": len(items),
+                    "fetched": _dt.datetime.utcfromtimestamp(_CVE_CACHE["ts"]).strftime("%Y-%m-%d %H:%M UTC")
+                    if _CVE_CACHE["ts"] else None})
 
 
 def _run_scan_job(job_id, opts, email_to, owner):
@@ -1214,7 +1268,10 @@ _PAGE = """<!DOCTYPE html>
   .tabbtn:hover { background:rgba(148,163,184,.10); color:var(--text); }
   .tabbtn.active { background:rgba(59,130,246,.16); color:#fff; box-shadow:inset 2px 0 0 var(--primary); }
   .content { flex:1; min-width:0; display:flex; flex-direction:column; }
-  .topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; background:rgba(15,23,42,.85); backdrop-filter:blur(8px); }
+  .topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 30px; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; background:rgba(15,23,42,.85); backdrop-filter:blur(8px); }
+  .topclock { font-variant-numeric:tabular-nums; font-size:12.5px; color:var(--muted); background:var(--field); border:1px solid var(--line); border-radius:999px; padding:4px 11px; white-space:nowrap; }
+  .quick { display:flex; flex-wrap:wrap; gap:10px; }
+  .quick .dash-jump { margin-top:0; }
   .topbar h1 { margin:0; font-size:15px; font-weight:600; color:#fff; display:flex; align-items:center; gap:10px; min-width:0; }
   .topbar h1 { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .topbar-logo { height:26px; max-width:120px; border-radius:4px; background:#fff; padding:2px; flex-shrink:0; }
@@ -1320,8 +1377,10 @@ _PAGE = """<!DOCTYPE html>
     .sidebar.open { transform:translateX(0); box-shadow:6px 0 28px rgba(0,0,0,.5); }
     .scrim.open { display:block; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:55; }
     .tabbtn { white-space:nowrap; }
-    .topbar { padding:12px 16px; }
+    .topbar { padding:14px 18px; gap:10px; }
     .topbar h1 { font-size:14px; }
+    .topclock { display:none; }
+    .quick .dash-jump { flex:1 1 100%; }
     .wrap { padding:16px; }
     .grid3 { grid-template-columns:1fr; }
     .stats { grid-template-columns:1fr 1fr; }
@@ -1348,6 +1407,8 @@ _PAGE = """<!DOCTYPE html>
 <div class="app">
 <aside class="sidebar">
   <div class="brand">{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" style="height:24px;border-radius:4px;background:#fff;padding:2px;">{% else %}<span class="dot"></span>{% endif %}Threat Intel</div>
+  <button class="tabbtn {{ 'active' if active_tab=='tab-dashboard' }}" data-tab="tab-dashboard">Dashboard</button>
+  <button class="tabbtn" data-tab="tab-latest-cves">Latest CVEs</button>
   {% if 'generate' in perms or 'analyze' in perms %}<div class="nav-group">Intelligence</div>{% endif %}
   {% if 'generate' in perms %}<button class="tabbtn {{ 'active' if active_tab=='tab-generate' }}" data-tab="tab-generate">Briefings</button>{% endif %}
   {% if 'analyze' in perms %}<button class="tabbtn" data-tab="tab-analyze">Analyze</button>{% endif %}
@@ -1368,9 +1429,89 @@ _PAGE = """<!DOCTYPE html>
 <header class="topbar">
   <button id="menu-toggle" class="menu-toggle" type="button" aria-label="Open menu">&#9776;</button>
   <h1>{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" class="topbar-logo">{% endif %}Threat Intelligence Briefing Agent</h1>
-  <div class="huser">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
+  <div class="huser"><span id="clock" class="topclock"></span>{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
 </header>
 <div class="wrap">
+
+  <section class="tab {{ 'active' if active_tab=='tab-dashboard' }}" id="tab-dashboard">
+  <div class="card">
+    <h2>Overview</h2>
+    <div class="stats">
+      <div class="stat"><div class="n">{{ stats.total }}</div><div class="l">Saved reports</div></div>
+      <div class="stat"><div class="n">{{ stats.cves }}</div><div class="l">CVEs in latest briefing</div></div>
+      <div class="stat"><div class="n">{{ assets|length }}</div><div class="l">Assets tracked</div></div>
+      <div class="stat"><div class="n" style="font-size:14px">{% if smtp_ready %}<span class="badge on">Ready</span>{% else %}<span class="badge off">Not set</span>{% endif %}</div><div class="l">Email (SMTP)</div></div>
+    </div>
+    <div class="note">Engine: {{ provider }}{% if model %} &middot; {{ model }}{% endif %}{% if stats.when %} &middot; latest briefing {{ stats.when }}{% endif %} &middot; next scheduled briefing {{ next_run or 'off' }}{% if next_scan_run %} &middot; next scan {{ next_scan_run }}{% endif %}{% if schedule.last_run %} &middot; last run {{ schedule.last_run }} ({{ schedule.last_status }}){% endif %}</div>
+  </div>
+
+  <div class="card">
+    <h2>Quick actions</h2>
+    <div class="quick">
+      {% if 'generate' in perms %}<button type="button" class="dash-jump" data-tab="tab-generate">New briefing</button>{% endif %}
+      {% if 'analyze' in perms %}<button type="button" class="dash-jump secondary" data-tab="tab-analyze">Analyze a file</button>{% endif %}
+      {% if 'generate' in perms %}<button type="button" class="dash-jump secondary" data-tab="tab-intel">CVE / actor lookup</button>{% endif %}
+      {% if 'scan' in perms %}<button type="button" class="dash-jump secondary" data-tab="tab-scan">Network scan</button>{% endif %}
+      <button type="button" class="dash-jump secondary" data-tab="tab-history">View history</button>
+    </div>
+  </div>
+
+  {% if scan_stats %}
+  <div class="card">
+    <h2>Latest network scan — risk</h2>
+    <div class="stats">
+      <div class="stat"><div class="n risk-{{ scan_stats.label|lower }}">{{ scan_stats.risk }}/100</div><div class="l">Risk · {{ scan_stats.label }}</div></div>
+      <div class="stat"><div class="n risk-critical">{{ scan_stats.counts.critical }}</div><div class="l">Critical</div></div>
+      <div class="stat"><div class="n risk-high">{{ scan_stats.counts.high }}</div><div class="l">High</div></div>
+      <div class="stat"><div class="n risk-medium">{{ scan_stats.counts.medium }}</div><div class="l">Medium</div></div>
+    </div>
+    <div class="note">Target {{ scan_stats.target }} &middot; {{ scan_stats.hosts_up }} responsive host(s) &middot; {{ scan_stats.open_ports }} open ports &middot; {{ scan_stats.cves }} potential CVEs ({{ scan_stats.kev }} in CISA KEV)</div>
+  </div>
+  {% endif %}
+
+  {% if assets %}
+  <div class="card">
+    <h2>Top assets by risk</h2>
+    <ul class="reports">
+      {% for a in assets[:5] %}
+      <li><span class="name"><span class="risk-{{ a.label|lower }}" style="font-weight:600">{{ a.risk }} · {{ a.label }}</span> <span style="color:var(--muted)">{{ a.ip }}{% if a.hostname %} ({{ a.hostname }}){% endif %}</span></span>
+      <span class="by">{{ a.ports|length }} open port(s)</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Latest CVEs <span id="dash-cve-meta" class="pill" style="display:none"></span></h2>
+    <p class="note">Newly published vulnerabilities from the NVD feed. <a href="#" class="dash-jump" data-tab="tab-latest-cves">See all →</a></p>
+    <div id="dash-cves"><p class="note">Loading latest CVEs…</p></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent reports</h2>
+    {% if reports %}
+    <ul class="reports">
+      {% for r in reports[:6] %}
+      <li><span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing','cve':'CVE','actor':'Actor','hunt':'Hunt'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="note">No reports yet — generate a briefing or run a scan to get started.</p>
+    {% endif %}
+  </div>
+  </section>
+
+  <section class="tab" id="tab-latest-cves">
+  <div class="card">
+    <h2>Latest CVEs <span id="cve-feed-meta" class="pill" style="display:none"></span></h2>
+    <p class="note">Recently published vulnerabilities from the NVD, flagged when listed in the CISA Known Exploited Vulnerabilities (KEV) catalog. {% if 'generate' in perms %}Use <b>Analyze</b> for a full grounded deep-dive.{% endif %}</p>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <button id="cve-refresh" type="button" class="secondary" style="margin-top:0">Refresh</button>
+      <span id="cve-feed-state" class="pill" style="display:none"></span>
+    </div>
+    <div id="cve-feed"><p class="note">Loading latest CVEs…</p></div>
+  </div>
+  </section>
 
   {% if 'generate' in perms %}
   <section class="tab {{ 'active' if active_tab=='tab-generate' }}" id="tab-generate">
@@ -1698,29 +1839,7 @@ _PAGE = """<!DOCTYPE html>
 
   <section class="tab" id="tab-settings">
   <div class="card">
-    <h2>Status</h2>
-    <div class="stats">
-      <div class="stat"><div class="n">{{ stats.total }}</div><div class="l">Saved briefings</div></div>
-      <div class="stat"><div class="n">{{ stats.cves }}</div><div class="l">CVEs in latest</div></div>
-      <div class="stat"><div class="n" style="font-size:14px">{% if smtp_ready %}<span class="badge on">Ready</span>{% else %}<span class="badge off">Not set</span>{% endif %}</div><div class="l">Email (SMTP)</div></div>
-      <div class="stat"><div class="n" style="font-size:13px">{{ next_run or 'Off' }}</div><div class="l">Next scheduled run</div></div>
-    </div>
-    <div class="note">Engine: {{ provider }}{% if model %} &middot; {{ model }}{% endif %}{% if stats.when %} &middot; latest briefing {{ stats.when }}{% endif %}{% if schedule.last_run %} &middot; last scheduled run {{ schedule.last_run }} ({{ schedule.last_status }}){% endif %}</div>
-  </div>
-  {% if scan_stats %}
-  <div class="card">
-    <h2>Latest network scan — risk</h2>
-    <div class="stats">
-      <div class="stat"><div class="n risk-{{ scan_stats.label|lower }}">{{ scan_stats.risk }}/100</div><div class="l">Risk · {{ scan_stats.label }}</div></div>
-      <div class="stat"><div class="n risk-critical">{{ scan_stats.counts.critical }}</div><div class="l">Critical</div></div>
-      <div class="stat"><div class="n risk-high">{{ scan_stats.counts.high }}</div><div class="l">High</div></div>
-      <div class="stat"><div class="n risk-medium">{{ scan_stats.counts.medium }}</div><div class="l">Medium</div></div>
-    </div>
-    <div class="note">Target {{ scan_stats.target }} &middot; {{ scan_stats.hosts_up }} responsive host(s) &middot; {{ scan_stats.open_ports }} open ports &middot; {{ scan_stats.cves }} potential CVEs ({{ scan_stats.kev }} in CISA KEV)</div>
-  </div>
-  {% endif %}
-  <div class="card">
-    <h2>Settings</h2>
+    <h2>Configuration</h2>
     <p class="note">These come from your <code>.env</code> file and are shown for reference. Edit <code>.env</code> and restart the app to change them.</p>
     <div class="grid3" style="margin-top:14px">
       <div><label>LLM provider</label><input value="{{ provider }}" readonly></div>
@@ -1844,13 +1963,30 @@ if (menuToggle && sidebarEl) menuToggle.addEventListener('click', () => {
 });
 if (navScrim) navScrim.addEventListener('click', closeNav);
 
-document.querySelectorAll('.tabbtn').forEach(b => b.addEventListener('click', () => {
-  document.querySelectorAll('.tabbtn').forEach(x => x.classList.remove('active'));
+// live UTC clock in the top bar
+const clockEl = document.getElementById('clock');
+if (clockEl) {
+  const tick = () => {
+    clockEl.textContent = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+  };
+  tick(); setInterval(tick, 1000);
+}
+
+// central tab switcher — used by sidebar nav and dashboard quick actions
+function activateTab(tabId) {
+  const sec = document.getElementById(tabId);
+  if (!sec) return;
+  document.querySelectorAll('.tabbtn').forEach(x => x.classList.toggle('active', x.dataset.tab === tabId));
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-  b.classList.add('active');
-  document.getElementById(b.dataset.tab).classList.add('active');
+  sec.classList.add('active');
   closeNav();
-}));
+  window.scrollTo({ top: 0 });
+}
+// event delegation so any current or future .tabbtn / .dash-jump works
+document.addEventListener('click', (e) => {
+  const nav = e.target.closest('.tabbtn, .dash-jump');
+  if (nav && nav.dataset.tab) { activateTab(nav.dataset.tab); }
+});
 
 // Settings: collapsible sections (accordion)
 document.querySelectorAll('#tab-settings > .card').forEach((card, i) => {
@@ -2171,6 +2307,67 @@ function wireIntel(formId, btnId, stateId, url, busyText) {
 wireIntel('cve-form', 'cve-btn', 'cve-state', '/cve-analyze', 'analyzing…');
 wireIntel('actor-form', 'actor-btn', 'actor-state', '/actor-profile', 'profiling…');
 wireIntel('hunt-form', 'hunt-btn', 'hunt-state', '/hunt-generate', 'generating…');
+
+// ── Latest CVEs feed (dashboard card + dedicated tab) ──
+const cveEsc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cveSev = (s) => { s = (s || '').toLowerCase(); return s.indexOf('crit')===0 ? 'risk-critical' : s.indexOf('high')===0 ? 'risk-high' : s.indexOf('med')===0 ? 'risk-medium' : 'risk-low'; };
+function cveTable(cves, withAnalyze) {
+  if (!cves || !cves.length) return '<p class="note">No recent CVEs returned — try Refresh in a moment.</p>';
+  let h = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:2px solid var(--line)">'
+        + '<th style="padding:8px">CVE</th><th style="padding:8px">CVSS</th><th style="padding:8px">Published</th><th style="padding:8px">Summary</th>'
+        + (withAnalyze ? '<th style="padding:8px"></th>' : '') + '</tr>';
+  cves.forEach(c => {
+    const kev = c.kev ? ' <span class="badge" style="background:#7f1d1d;color:#fca5a5">KEV</span>' : '';
+    const sev = (c.cvss != null) ? '<span class="' + cveSev(c.severity) + '" style="font-weight:600">' + cveEsc(c.cvss) + '</span> ' + cveEsc(c.severity) : '—';
+    const act = withAnalyze ? '<td style="padding:8px"><button type="button" class="dl cve-analyze" data-cve="' + cveEsc(c.cve) + '">Analyze</button></td>' : '';
+    h += '<tr style="border-bottom:1px solid var(--line)">'
+      + '<td style="padding:8px;white-space:nowrap"><a href="https://nvd.nist.gov/vuln/detail/' + cveEsc(c.cve) + '" target="_blank">' + cveEsc(c.cve) + '</a>' + kev + '</td>'
+      + '<td style="padding:8px;white-space:nowrap">' + sev + '</td>'
+      + '<td style="padding:8px;white-space:nowrap;color:var(--muted)">' + cveEsc(c.published) + '</td>'
+      + '<td style="padding:8px;color:var(--muted)">' + cveEsc(c.description) + '</td>'
+      + act + '</tr>';
+  });
+  return h + '</table>';
+}
+async function loadCves(targetId, limit, withAnalyze, metaId, stateId) {
+  const el = document.getElementById(targetId);
+  if (!el) return;
+  const st = stateId ? document.getElementById(stateId) : null;
+  if (st) { st.style.display = 'inline'; st.textContent = 'loading…'; st.className = 'pill'; }
+  try {
+    const d = await (await fetch('/api/latest-cves?limit=' + limit)).json();
+    el.innerHTML = cveTable(d.cves || [], withAnalyze);
+    if (metaId && d.fetched) { const m = document.getElementById(metaId); if (m) { m.style.display = 'inline'; m.textContent = 'updated ' + d.fetched; } }
+    if (st) st.style.display = 'none';
+  } catch (err) {
+    el.innerHTML = '<p class="err">Couldn\\'t load CVEs right now.</p>';
+    if (st) { st.textContent = 'error'; st.className = 'pill err'; }
+  }
+}
+loadCves('dash-cves', 10, false, 'dash-cve-meta', null);   // dashboard card on page load
+let cveTabLoaded = false;
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-tab="tab-latest-cves"]') && !cveTabLoaded) {
+    cveTabLoaded = true;
+    loadCves('cve-feed', 50, true, 'cve-feed-meta', 'cve-feed-state');
+  }
+});
+const cveRefresh = document.getElementById('cve-refresh');
+if (cveRefresh) cveRefresh.addEventListener('click', () => loadCves('cve-feed', 50, true, 'cve-feed-meta', 'cve-feed-state'));
+// "Analyze" on a CVE row -> jump to Threat Intel, prefill + run (or open NVD if no access)
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('.cve-analyze');
+  if (!a) return;
+  const input = document.getElementById('cve-id');
+  if (input) {
+    activateTab('tab-intel');
+    input.value = a.dataset.cve;
+    const f = document.getElementById('cve-form');
+    if (f) f.requestSubmit();
+  } else {
+    window.open('https://nvd.nist.gov/vuln/detail/' + a.dataset.cve, '_blank');
+  }
+});
 
 // network scan
 const scanForm = document.getElementById('scan-form');
