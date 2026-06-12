@@ -6,6 +6,7 @@ import datetime
 import logging
 import socket
 
+import apikeys
 from agent.llm import build_client
 from collectors import kev, nvd
 from config import CONFIG
@@ -151,7 +152,7 @@ def _correlate(products: list[str]) -> list[dict]:
     for product in products:
         try:
             res = nvd.search_by_keyword(product, min_cvss=7.0, limit=5,
-                                        api_key=CONFIG.nvd_api_key)
+                                        api_key=apikeys.get("NVD_API_KEY"))
         except Exception as err:
             log.info("NVD lookup failed for %s: %s", product, err)
             continue

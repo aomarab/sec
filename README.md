@@ -48,40 +48,49 @@ across every step of the agent loop, cutting cost and latency). To use a
 different provider instead, set `LLM_PROVIDER=openai` (or `azure` / `ollama`)
 and the matching keys.
 
-### Run a single briefing now
+### Run with Docker (recommended)
+
+The container runs the full web app (UI + scheduler + scanner, with `nmap`
+pre-installed). One service, one persistent volume.
 
 ```bash
-docker compose run --rm -e RUN_MODE=once threat-intel-agent
+docker compose up -d --build
+docker compose logs -f          # watch startup
 ```
 
-The briefing is written to `./reports/` as both `.md` and `.html`.
+Open **http://localhost:5000** and sign in (first run seeds an admin from
+`ADMIN_USER` / `ADMIN_PASSWORD` in `.env`, default `admin` / `admin`).
 
-### Run on a schedule (default 07:00 UTC daily)
+All state — reports, users, schedules, assets, alerts, branding, the session
+secret — is stored in **`./data/`** on the host (mounted at `/app/data`). Back up
+that folder to preserve everything. Update with:
 
 ```bash
-docker compose up -d        # RUN_MODE defaults to schedule in compose
-docker compose logs -f
+docker compose up -d --build    # rebuild after code changes
+docker compose down             # stop
 ```
 
-Change the cadence with `SCHEDULE_CRON` (standard cron, UTC), e.g. `0 6 * * 1-5`
-for 06:00 on weekdays.
+**Run a one-off briefing from the CLI** (no UI) using the same image:
 
-### Web UI (browser app)
+```bash
+docker compose run --rm web python main.py
+```
 
-Run the front end and drive it from a browser — set parameters, trigger a
-briefing, watch the agent's progress live, and read past reports:
+**Scan your local network:** a bridged container can't see your LAN. On a Linux
+host, switch to host networking — comment out the `ports:` line and uncomment
+`network_mode: host` + `cap_add` in `docker-compose.yml`, then rebuild.
+
+### Run without Docker
 
 ```bash
 pip install -r requirements.txt
-python webapp.py
+python webapp.py                # web app on http://localhost:5000
+# or: python main.py            # one-off / cron briefing, no UI
 ```
 
-Then open **http://localhost:5000**. With Docker: `docker compose up web` and
-open the same URL. Reports are saved to `./reports/` and listed in the UI.
-
-The web UI is organised into tabs: **Generate** (on-demand briefing), **Analyze
-file**, **Schedule** (recurring emailed briefings), **History** (view / download
-HTML, PDF, Markdown / preview / delete), **Dashboard**, and **Settings**.
+The web UI is organised into tabs — **Generate**, **Analyze file**, **Network
+scan**, **Assets**, **Schedule**, **History**, **Settings** (+ **Admin** for
+admins) — plus a floating **AI assistant** chat bubble.
 
 ### Network vulnerability scan
 
@@ -108,6 +117,30 @@ vulnerable?", "how do I remediate CVE-X?", "what's the business impact?" — and
 generates remediation as PowerShell / Bash / Azure CLI. Optionally **ground the
 chat in one of your reports** (a scan or analysis) so answers reference its actual
 findings, hosts, and CVEs instead of generic advice.
+
+### OSINT recon (theHarvester-style)
+
+The **Recon** tab (requires the *Scan networks* privilege) maps a domain's public
+footprint without scraping search engines:
+
+- **Subdomains** from Certificate Transparency logs (crt.sh — free, no key)
+- **DNS records** (A/AAAA/MX/NS/TXT/CNAME) via DNS-over-HTTPS (Cloudflare — free)
+- **Hosts/IPs** by resolving discovered subdomains
+- **Optional vendor enrichment** when a key is set in `.env`: **Shodan**
+  (`SHODAN_API_KEY` — open ports, org, known vulns) and **Hunter.io**
+  (`HUNTER_API_KEY` — emails)
+
+It also **deeply inspects** what it finds:
+- **Web technology fingerprinting** — fetches each live host and detects server,
+  CDN, CMS, framework, and analytics (WordPress, Shopify, Drupal, Next.js, React,
+  Cloudflare, etc.) from headers + HTML.
+- **IP intelligence** — ASN, ISP/hosting org, geolocation, and reverse DNS for
+  every discovered IP (via ip-api, free).
+- **Email security** — SPF and DMARC presence (flags spoofing risk if missing).
+
+Output is an AI attack-surface summary + tables, saved to History (and exportable
+to CSV/Excel); discovered hosts are added to the **Assets** inventory. Requires an
+authorization checkbox — only assess domains you own or are authorized to test.
 
 ### Assets, scheduled scans & alerts
 
@@ -161,6 +194,18 @@ model produces a structured report:
 Indicators are extracted deterministically (defanged forms like `1.2.3[.]4` are
 handled), so long hashes are never altered. Benign reporting/vendor domains
 (cisa.gov, fbi.gov, etc.) are filtered out of the IOC table.
+
+**Vendor-API enrichment** — when API keys are set in `.env`, each analysis also:
+- computes the file's MD5/SHA1/SHA256 and looks the file up on **VirusTotal**
+  (detection ratio + threat label) — useful when the upload is a suspected sample;
+- enriches extracted IOCs via **VirusTotal** (IPs/domains/hashes) and **AbuseIPDB**
+  (IP abuse score), shown with **source, verdict, and confidence**.
+
+Vendor keys (VirusTotal, AbuseIPDB, Shodan, Hunter.io, NVD) are entered by an
+admin in **Settings → Vendor API keys** — no `.env` editing needed. A stored key
+overrides the matching `.env` variable if both are set; clearing it reverts to
+`.env`. Without keys, the IOC table still shows clickable VT/AbuseIPDB lookup
+links. Lookups are capped (`ENRICH_BUDGET`, default 12) to respect rate limits.
 
 ### Without Docker (CLI / scheduled)
 

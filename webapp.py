@@ -27,10 +27,12 @@ import auth
 from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
 from analysis.extract import SUPPORTED as ALLOWED_EXT
+from analysis import vendor as vendor_analysis
 from briefing import delivery, export, report
 from config import CONFIG
 from scan import scanner as scan_scanner
 from scan.assess import run_scan
+from recon.harvester import run_recon
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -335,6 +337,8 @@ def _list_reports():
             kind = "analysis"
         elif name.startswith("scan-"):
             kind = "scan"
+        elif name.startswith("recon-"):
+            kind = "recon"
         else:
             kind = "briefing"
         out.append({"filename": name, "kind": kind, "owner": owners.get(name, "")})
@@ -655,6 +659,32 @@ def analyze():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/vendor-analyze", methods=["POST"])
+@auth.require_perm("analyze")
+def vendor_analyze():
+    """Discover the vendor from a pasted API key, then look up one indicator or
+    an uploaded file against that vendor."""
+    api_key = (request.form.get("api_key") or "").strip()
+    indicator = (request.form.get("indicator") or "").strip()
+    f = request.files.get("file")
+    file_path = None
+    if f and f.filename:
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        safe = secure_filename(f.filename) or "upload"
+        file_path = os.path.join(UPLOADS_DIR, uuid.uuid4().hex[:8] + "_" + safe)
+        f.save(file_path)
+    if not api_key:
+        return jsonify({"error": "Enter a vendor API key."}), 400
+    if not file_path and not indicator:
+        return jsonify({"error": "Enter an indicator or choose a file to analyze."}), 400
+    try:
+        result = vendor_analysis.analyze(api_key=api_key, indicator=indicator, file_path=file_path)
+    except Exception as err:
+        log.exception("Vendor analysis failed")
+        return jsonify({"error": f"Analysis error: {err}"}), 500
+    return jsonify(result)
+
+
 def _run_scan_job(job_id, opts, email_to, owner):
     job = JOBS[job_id]
     handler = _ListHandler(job["logs"])
@@ -718,6 +748,55 @@ def scan_route():
     return jsonify({"job_id": job_id})
 
 
+def _run_recon_job(job_id, domain, opts, owner):
+    job = JOBS[job_id]
+    handler = _ListHandler(job["logs"])
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        def progress(done, total):
+            log.info("Resolved %d / %d hosts", done, total)
+        result = run_recon(domain, opts, CONFIG, progress)
+        out = report.render(result["markdown"], prefix="recon")
+        fname = os.path.basename(out["html_path"])
+        _set_owner(fname, owner)
+        assets = result.get("assets", [])
+        _upsert_assets(assets)
+        targets = sorted({a["ip"] for a in assets if a.get("ip")})[:64]
+        job["report"] = {"title": out["title"], "filename": fname,
+                         "emailed": False, "owner": owner,
+                         "targets": ", ".join(targets), "target_count": len(targets)}
+        job["status"] = "done"
+        log.info("Recon report ready: %s", out["title"])
+    except Exception as err:
+        job["status"] = "error"
+        job["error"] = str(err)
+        log.exception("Recon job failed")
+    finally:
+        root.removeHandler(handler)
+
+
+@app.route("/recon", methods=["POST"])
+@auth.require_perm("scan")
+def recon_route():
+    f = request.form
+    if f.get("authorized") != "on":
+        return jsonify({"error": "You must confirm you are authorized to assess this domain."}), 400
+    domain = (f.get("domain") or "").strip()
+    if not domain:
+        return jsonify({"error": "Enter a domain, e.g. example.com"}), 400
+    opts = {"use_shodan": f.get("use_shodan") == "on", "use_hunter": f.get("use_hunter") == "on",
+            "fingerprint": f.get("fingerprint", "on") == "on",
+            "ip_intel": f.get("ip_intel", "on") == "on"}
+    owner = auth.current_user()["username"]
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    threading.Thread(target=_run_recon_job, args=(job_id, domain, opts, owner), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/scan/schedule", methods=["POST"])
 @auth.require_perm("scan")
 def save_scan_schedule():
@@ -752,6 +831,43 @@ def save_scan_schedule():
 @auth.require_perm("scan")
 def assets_list():
     return jsonify({"assets": _list_assets()})
+
+
+def _assets_markdown():
+    assets = _list_assets()
+    lines = ["# Asset Inventory", "",
+             f"_{len(assets)} host(s) · generated "
+             f"{_dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_", "",
+             "## Assets", "",
+             "| IP | Hostname | OS | Open ports | Services | Risk | Last scan |",
+             "|----|----------|----|-----------|----------|------|-----------|"]
+    for a in assets:
+        ports = ", ".join(str(p) for p in a.get("ports", [])) or "—"
+        svcs = ", ".join(a.get("services", [])) or "—"
+        lines.append(f"| `{a.get('ip','')}` | {a.get('hostname') or '—'} | {a.get('os') or '—'} "
+                     f"| {ports} | {svcs} | {a.get('risk',0)} {a.get('label','')} "
+                     f"| {a.get('last_scan','')} |")
+    if not assets:
+        lines.append("| _no assets_ | | | | | | |")
+    return "\n".join(lines)
+
+
+@app.route("/assets/export")
+@auth.require_perm("scan")
+def assets_export():
+    fmt = request.args.get("fmt", "html").lower()
+    md = _assets_markdown()
+    stamp = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    if fmt == "csv":
+        return send_file(io.BytesIO(export.to_csv(export.extract_tables(md)).encode("utf-8-sig")),
+                         mimetype="text/csv", as_attachment=True, download_name=f"assets-{stamp}.csv")
+    if fmt == "xlsx":
+        return send_file(io.BytesIO(export.to_xlsx_bytes(export.extract_tables(md))),
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         as_attachment=True, download_name=f"assets-{stamp}.xlsx")
+    html = report.to_html(md, title="Asset Inventory", heading="Asset Inventory")
+    return send_file(io.BytesIO(html.encode("utf-8")), mimetype="text/html",
+                     as_attachment=True, download_name=f"assets-{stamp}.html")
 
 
 @app.route("/assets/clear", methods=["POST"])
@@ -1028,95 +1144,114 @@ _PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Threat Intelligence Briefing Agent</title>
 <style>
-  :root { --navy:#0f2a43; --line:#e2e5e9; --muted:#6b7280; --accent:#1d4671; }
+  :root { --bg:#0F172A; --panel:#0B1220; --card:#1E293B; --line:#334155; --muted:#94A3B8; --text:#F8FAFC; --primary:#3B82F6; --primary-d:#2563EB; --field:#0F172A; }
   * { box-sizing:border-box; }
-  body { margin:0; font-family:'Segoe UI',-apple-system,Arial,sans-serif; background:#eef1f5; color:#1f2328; }
-  header { background:linear-gradient(135deg,#0f2a43,#1d4671); color:#fff; padding:18px 28px; }
-  header .hwrap { max-width:960px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; }
-  header h1 { margin:0; font-size:19px; }
-  header .huser { font-size:13px; opacity:.9; display:flex; align-items:center; gap:12px; white-space:nowrap; }
-  header .huser a { color:#fff; opacity:.85; }
-  .tabbar { background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
-  .tabbar .wrapbar { max-width:960px; margin:0 auto; display:flex; gap:2px; padding:0 16px; flex-wrap:wrap; }
-  .tabbtn { background:none; border:0; padding:14px 16px; margin:0; color:var(--muted); font-size:14px; cursor:pointer; border-bottom:3px solid transparent; border-radius:0; }
-  .tabbtn:hover { color:var(--navy); }
-  .tabbtn.active { color:var(--navy); font-weight:600; border-bottom-color:var(--accent); }
+  body { margin:0; font-family:'Segoe UI',-apple-system,Inter,Arial,sans-serif; background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased; }
+  .app { display:flex; min-height:100vh; }
+  .sidebar { width:236px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--line); padding:16px 12px; position:sticky; top:0; height:100vh; overflow:auto; display:flex; flex-direction:column; gap:3px; }
+  .brand { display:flex; align-items:center; gap:10px; color:#fff; font-weight:700; font-size:15px; padding:6px 8px 12px; letter-spacing:.02em; }
+  .brand .dot { width:9px; height:9px; border-radius:50%; background:var(--primary); box-shadow:0 0 10px var(--primary); flex-shrink:0; }
+  .nav-group { font-size:10px; text-transform:uppercase; letter-spacing:.09em; color:#64748b; margin:12px 8px 4px; }
+  .tabbtn { display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:none; border:0; color:var(--muted); font-size:13.5px; padding:9px 11px; border-radius:8px; cursor:pointer; margin:0; }
+  .tabbtn:hover { background:rgba(148,163,184,.10); color:var(--text); }
+  .tabbtn.active { background:rgba(59,130,246,.16); color:#fff; box-shadow:inset 2px 0 0 var(--primary); }
+  .content { flex:1; min-width:0; display:flex; flex-direction:column; }
+  .topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; background:rgba(15,23,42,.85); backdrop-filter:blur(8px); }
+  .topbar h1 { margin:0; font-size:15px; font-weight:600; color:#fff; }
+  .topbar .huser { font-size:13px; color:var(--muted); display:flex; gap:12px; align-items:center; white-space:nowrap; }
+  .topbar .huser a { color:var(--primary); }
+  .wrap { max-width:1200px; width:100%; margin:0 auto; padding:24px; }
   .tab { display:none; }
   .tab.active { display:flex; flex-direction:column; gap:20px; }
-  input[readonly] { background:#f7f9fb; color:#6b7280; cursor:default; }
-  .wrap { max-width:960px; margin:24px auto; padding:0 16px; }
-  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px 22px; }
-  .card h2 { margin:0 0 14px; font-size:15px; color:var(--navy); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 22px; box-shadow:0 1px 2px rgba(0,0,0,.25); }
+  .card h2 { margin:0 0 14px; font-size:15px; color:#fff; }
   .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
   label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
-  input, select, textarea { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:6px; font-size:14px; background:#fff; font-family:inherit; }
+  input, select, textarea { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:6px; font-size:14px; background:var(--field); color:var(--text); font-family:inherit; }
+  input::placeholder, textarea::placeholder { color:#64748b; }
+  input[readonly] { background:#0b1220; color:var(--muted); cursor:default; }
   textarea { resize:vertical; min-height:60px; }
-  button { background:var(--navy); color:#fff; border:0; padding:11px 20px; border-radius:6px; font-size:14px; cursor:pointer; margin-top:12px; }
+  button { background:var(--primary); color:#fff; border:0; padding:11px 20px; border-radius:6px; font-size:14px; cursor:pointer; margin-top:12px; }
+  button:hover { background:var(--primary-d); }
   button:disabled { opacity:.5; cursor:not-allowed; }
-  button.secondary { background:#eef1f4; color:var(--navy); border:1px solid var(--line); }
+  button.secondary { background:transparent; color:var(--text); border:1px solid var(--line); }
+  button.secondary:hover { background:rgba(148,163,184,.10); }
   .row { margin-top:14px; }
   .presets { display:flex; flex-wrap:wrap; gap:14px; margin-top:6px; }
-  .presets label { display:flex; align-items:center; gap:6px; font-size:13px; color:#1f2328; margin:0; }
+  .presets label { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text); margin:0; }
   .presets input { width:auto; }
   .check { display:flex; align-items:center; gap:8px; margin-top:6px; }
   .check input { width:auto; }
   .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
-  .stat { background:#f7f9fb; border:1px solid var(--line); border-radius:10px; padding:14px; }
-  .stat .n { font-size:22px; font-weight:700; color:var(--navy); }
+  .stat { background:var(--field); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .stat .n { font-size:22px; font-weight:700; color:#fff; }
   .stat .l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-top:4px; }
-  .risk-critical { color:#b42318; } .risk-high { color:#c2410c; } .risk-medium { color:#a16207; }
-  .risk-low { color:#166534; } .risk-minimal { color:#166534; }
+  .risk-critical { color:#f87171; } .risk-high { color:#fb923c; } .risk-medium { color:#fbbf24; }
+  .risk-low { color:#4ade80; } .risk-minimal { color:#4ade80; }
   .badge { font-size:11px; padding:2px 8px; border-radius:999px; }
-  .badge.on { background:#dcfce7; color:#166534; } .badge.off { background:#f3f4f6; color:#6b7280; }
-  .console { background:#0b1622; color:#cfe3f7; font-family:Consolas,monospace; font-size:12px; border-radius:8px; padding:14px; height:240px; overflow:auto; white-space:pre-wrap; display:none; margin-top:14px; }
-  .pill { font-size:11px; padding:2px 8px; border-radius:999px; background:#eef1f4; color:var(--muted); margin-left:8px; }
-  .ok { color:#1a7f37; } .err { color:#b42318; }
+  .badge.on { background:rgba(34,197,94,.18); color:#4ade80; } .badge.off { background:rgba(148,163,184,.15); color:#94a3b8; }
+  .console { background:#060c16; color:#9fd0f5; font-family:Consolas,monospace; font-size:12px; border:1px solid var(--line); border-radius:8px; padding:14px; height:240px; overflow:auto; white-space:pre-wrap; display:none; margin-top:14px; }
+  .pill { font-size:11px; padding:2px 8px; border-radius:999px; background:rgba(148,163,184,.15); color:var(--muted); margin-left:8px; }
+  .ok { color:#4ade80; } .err { color:#f87171; }
   .note { font-size:12px; color:var(--muted); margin-top:8px; }
-  .warn { background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; font-size:12px; padding:8px 10px; border-radius:6px; margin-top:10px; }
+  .warn { background:rgba(245,158,11,.12); border:1px solid rgba(245,158,11,.45); color:#fbbf24; font-size:12px; padding:8px 10px; border-radius:6px; margin-top:10px; }
   ul.reports { list-style:none; margin:0; padding:0; }
   ul.reports li { padding:10px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
   ul.reports li:last-child { border-bottom:0; }
   ul.reports li .name { display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto; }
   ul.reports li .name a { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .kind { font-size:10px; padding:2px 7px; border-radius:999px; font-weight:600; flex-shrink:0; letter-spacing:.02em; text-transform:uppercase; }
-  .kind.briefing { background:#dbeafe; color:#1e40af; }
-  .kind.analysis { background:#ede9fe; color:#6d28d9; }
-  .kind.scan { background:#ccfbf1; color:#0f766e; }
-  .by { color:#6b7280; font-size:12px; white-space:nowrap; }
+  .kind.briefing { background:rgba(59,130,246,.18); color:#93c5fd; }
+  .kind.analysis { background:rgba(139,92,246,.18); color:#c4b5fd; }
+  .kind.scan { background:rgba(20,184,166,.20); color:#5eead4; }
+  .kind.recon { background:rgba(245,158,11,.18); color:#fcd34d; }
+  .by { color:var(--muted); font-size:12px; white-space:nowrap; }
   .ms { position:relative; }
-  .ms-toggle { width:100%; margin-top:0; text-align:left; background:#fff; color:#1f2328; border:1px solid var(--line); padding:9px 10px; border-radius:6px; font-size:14px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px; }
-  .ms-toggle .ms-arrow { color:#6b7280; }
-  .ms-panel { position:absolute; z-index:30; left:0; right:0; top:calc(100% + 4px); background:#fff; border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.14); max-height:240px; overflow:auto; padding:6px; display:none; }
+  .ms-toggle { width:100%; margin-top:0; text-align:left; background:var(--field); color:var(--text); border:1px solid var(--line); padding:9px 10px; border-radius:6px; font-size:14px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .ms-toggle .ms-arrow { color:var(--muted); }
+  .ms-panel { position:absolute; z-index:30; left:0; right:0; top:calc(100% + 4px); background:var(--card); border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.5); max-height:240px; overflow:auto; padding:6px; display:none; }
   .ms.open .ms-panel { display:block; }
-  .ms-opt { display:flex; align-items:center; gap:8px; padding:6px 8px; font-size:13px; border-radius:6px; cursor:pointer; margin:0; white-space:nowrap; }
-  .ms-opt:hover { background:#f4f8ff; }
+  .ms-opt { display:flex; align-items:center; gap:8px; padding:6px 8px; font-size:13px; border-radius:6px; cursor:pointer; margin:0; white-space:nowrap; color:var(--text); }
+  .ms-opt:hover { background:rgba(59,130,246,.14); }
   .ms-opt input { width:auto; margin:0; }
-  a { color:#1f6feb; text-decoration:none; } a:hover { text-decoration:underline; }
+  a { color:#60a5fa; text-decoration:none; } a:hover { text-decoration:underline; }
   .actions { display:flex; gap:6px; align-items:center; flex-shrink:0; flex-wrap:wrap; }
-  .dl, .pv { font-size:12px; border:1px solid var(--line); padding:4px 9px; border-radius:6px; color:#1f6feb; cursor:pointer; background:#fff; }
-  .dl:hover, .pv:hover { background:#f4f8ff; text-decoration:none; }
-  .del { background:#fff; color:#b42318; border:1px solid #f3c0b8; padding:4px 9px; border-radius:6px; font-size:12px; cursor:pointer; margin:0; }
-  .del:hover { background:#fef2f2; }
-  #stop-btn { background:#b42318; margin-left:8px; }
-  #clear-btn { background:#b42318; font-size:13px; padding:8px 14px; }
+  .dl, .pv { font-size:12px; border:1px solid var(--line); padding:4px 9px; border-radius:6px; color:#93c5fd; cursor:pointer; background:transparent; }
+  .dl:hover, .pv:hover { background:rgba(59,130,246,.14); text-decoration:none; }
+  .del { background:transparent; color:#f87171; border:1px solid rgba(239,68,68,.45); padding:4px 9px; border-radius:6px; font-size:12px; cursor:pointer; margin:0; }
+  .del:hover { background:rgba(239,68,68,.14); }
+  #stop-btn { background:#ef4444; margin-left:8px; } #stop-btn:hover { background:#dc2626; }
+  #clear-btn { background:#ef4444; font-size:13px; padding:8px 14px; } #clear-btn:hover { background:#dc2626; }
   #search { margin-bottom:12px; }
   #preview { width:100%; height:520px; border:1px solid var(--line); border-radius:8px; margin-top:14px; display:none; background:#fff; }
-  .aichat { border:1px solid var(--line); border-radius:8px; padding:12px; height:380px; overflow:auto; background:#fbfcfe; display:flex; flex-direction:column; gap:10px; margin-top:6px; }
-  .msg { max-width:88%; padding:10px 12px; border-radius:10px; font-size:14px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
-  .msg.user { align-self:flex-end; background:#1d4671; color:#fff; }
-  .msg.bot { align-self:flex-start; background:#fff; border:1px solid var(--line); font-family:Consolas,Menlo,monospace; }
-  /* Wide app tables (assets, users) scroll horizontally instead of breaking layout */
   .card table { max-width:100%; }
-  @media (max-width:760px) {
-    .wrap { padding:0 10px; margin:16px auto; }
+  .card table th, .card table td { border-color:var(--line) !important; color:var(--text); }
+  .aichat { border:1px solid var(--line); border-radius:8px; padding:12px; height:380px; overflow:auto; background:#060c16; display:flex; flex-direction:column; gap:10px; margin-top:6px; }
+  .msg { max-width:88%; padding:10px 12px; border-radius:10px; font-size:14px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+  .msg.user { align-self:flex-end; background:var(--primary); color:#fff; }
+  .msg.bot { align-self:flex-start; background:var(--field); color:#e2e8f0; border:1px solid var(--line); font-family:Consolas,Menlo,monospace; }
+  #ai-fab { position:fixed; right:22px; bottom:22px; width:56px; height:56px; border-radius:50%; background:var(--primary); color:#fff; border:0; font-size:24px; cursor:pointer; box-shadow:0 6px 24px rgba(59,130,246,.5); z-index:1000; margin:0; display:flex; align-items:center; justify-content:center; }
+  #ai-fab:hover { background:var(--primary-d); }
+  #ai-widget { position:fixed; right:22px; bottom:88px; width:380px; max-width:92vw; height:520px; max-height:78vh; background:var(--card); border:1px solid var(--line); border-radius:14px; box-shadow:0 16px 48px rgba(0,0,0,.55); display:none; flex-direction:column; overflow:hidden; z-index:1000; }
+  #ai-widget.open { display:flex; }
+  .ai-head { background:linear-gradient(135deg,#0f2a43,#1d4671); color:#fff; padding:12px 14px; display:flex; justify-content:space-between; align-items:center; font-size:14px; font-weight:600; }
+  .ai-head button { background:none; border:0; color:#fff; font-size:22px; line-height:1; cursor:pointer; margin:0; padding:0; }
+  .ai-body { display:flex; flex-direction:column; gap:8px; padding:10px; flex:1; min-height:0; }
+  .ai-body .aichat { flex:1; height:auto; margin-top:0; }
+  .ai-body form { display:flex; gap:8px; }
+  .ai-body #ai-input { flex:1; }
+  .ai-body #ai-send { margin-top:0; }
+  @media (max-width:860px) {
+    .app { flex-direction:column; }
+    .sidebar { width:100%; height:auto; position:sticky; top:0; flex-direction:row; overflow-x:auto; gap:4px; border-right:0; border-bottom:1px solid var(--line); -webkit-overflow-scrolling:touch; z-index:30; }
+    .sidebar .brand, .sidebar .nav-group { display:none; }
+    .tabbtn { white-space:nowrap; }
+    .tabbtn.active { box-shadow:inset 0 -2px 0 var(--primary); }
+    .topbar { padding:12px 16px; }
+    .topbar h1 { font-size:14px; }
+    .wrap { padding:16px; }
     .grid3 { grid-template-columns:1fr; }
     .stats { grid-template-columns:1fr 1fr; }
-    .tabbar .wrapbar { overflow-x:auto; flex-wrap:nowrap; -webkit-overflow-scrolling:touch; }
-    .tabbtn { padding:12px 12px; font-size:13px; white-space:nowrap; }
-    header { padding:14px 16px; }
-    header h1 { font-size:16px; }
-    header .hwrap { flex-wrap:wrap; gap:6px; }
-    header .huser { font-size:12px; }
     .card { padding:16px; }
     .card table { display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
     ul.reports li { flex-direction:column; align-items:flex-start; }
@@ -1137,21 +1272,28 @@ _PAGE = """<!DOCTYPE html>
   </div>
 </div>
 {% endmacro %}
-<header><div class="hwrap">
-  <h1 style="display:flex;align-items:center;gap:10px;">{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" style="height:30px;border-radius:4px;background:#fff;padding:2px;">{% endif %}Threat Intelligence Briefing Agent</h1>
-  <div class="huser">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
-</div></header>
-<nav class="tabbar"><div class="wrapbar">
-  {% if 'generate' in perms %}<button class="tabbtn {{ 'active' if active_tab=='tab-generate' }}" data-tab="tab-generate">Generate</button>{% endif %}
-  {% if 'analyze' in perms %}<button class="tabbtn" data-tab="tab-analyze">Analyze file</button>{% endif %}
-  {% if 'scan' in perms %}<button class="tabbtn" data-tab="tab-scan">Network scan</button>{% endif %}
-  {% if 'scan' in perms %}<button class="tabbtn" data-tab="tab-assets">Assets</button>{% endif %}
+<div class="app">
+<aside class="sidebar">
+  <div class="brand">{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" style="height:24px;border-radius:4px;background:#fff;padding:2px;">{% else %}<span class="dot"></span>{% endif %}Threat Intel</div>
+  {% if 'generate' in perms or 'analyze' in perms %}<div class="nav-group">Intelligence</div>{% endif %}
+  {% if 'generate' in perms %}<button class="tabbtn {{ 'active' if active_tab=='tab-generate' }}" data-tab="tab-generate">Briefings</button>{% endif %}
+  {% if 'analyze' in perms %}<button class="tabbtn" data-tab="tab-analyze">File Analysis</button>{% endif %}
+  {% if 'scan' in perms %}<div class="nav-group">Attack Surface</div>
+  <button class="tabbtn" data-tab="tab-scan">Network Scan</button>
+  <button class="tabbtn" data-tab="tab-recon">OSINT Recon</button>
+  <button class="tabbtn" data-tab="tab-assets">Assets</button>{% endif %}
+  <div class="nav-group">Operations</div>
   {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
   <button class="tabbtn {{ 'active' if active_tab=='tab-history' }}" data-tab="tab-history">History</button>
-  <button class="tabbtn" data-tab="tab-assistant">AI assistant</button>
+  <div class="nav-group">System</div>
   <button class="tabbtn" data-tab="tab-settings">Settings</button>
   {% if is_admin %}<button class="tabbtn" data-tab="tab-admin">Admin</button>{% endif %}
-</div></nav>
+</aside>
+<div class="content">
+<header class="topbar">
+  <h1>Threat Intelligence Briefing Agent</h1>
+  <div class="huser">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
+</header>
 <div class="wrap">
 
   {% if 'generate' in perms %}
@@ -1203,6 +1345,22 @@ _PAGE = """<!DOCTYPE html>
       <span id="a-state" class="pill" style="display:none"></span>
     </form>
     <div id="a-console" class="console"></div>
+  </div>
+  <div class="card">
+    <h2>Vendor lookup</h2>
+    <p class="note">Paste a vendor API key and an indicator (IP, domain, URL, or file hash) — or choose a file. The app detects which vendor the key belongs to (VirusTotal, AbuseIPDB, Shodan, Hunter.io, or NVD) and runs the lookup. Keys are used for this request only and never stored.</p>
+    <form id="vendor-form">
+      <div class="row"><label>Vendor API key</label>
+        <input id="vendor-key" name="api_key" type="password" autocomplete="off" placeholder="Paste your VirusTotal / AbuseIPDB / Shodan / Hunter.io / NVD key"></div>
+      <div class="grid3">
+        <div style="grid-column:span 2"><label>Indicator (IP, domain, URL, or file hash)</label>
+          <input id="vendor-indicator" name="indicator" placeholder="8.8.8.8 · evil-domain.com · https://… · a1b2c3… hash"></div>
+        <div><label>…or a file</label><input id="vendor-file" name="file" type="file"></div>
+      </div>
+      <button id="vendor-btn" type="submit">Analyze</button>
+      <span id="v-state" class="pill" style="display:none"></span>
+    </form>
+    <div id="vendor-result" style="margin-top:14px"></div>
   </div>
   </section>
   {% endif %}
@@ -1294,10 +1452,49 @@ _PAGE = """<!DOCTYPE html>
       </tr>
       {% endfor %}
     </table>
-    <button id="assets-clear" type="button" class="secondary" style="margin-top:12px">Clear inventory</button>
+    <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+      <a class="dl" href="/assets/export?fmt=html">Download HTML</a>
+      <a class="dl" href="/assets/export?fmt=csv">CSV</a>
+      <a class="dl" href="/assets/export?fmt=xlsx">XLSX</a>
+      <button id="assets-clear" type="button" class="secondary" style="margin-top:0">Clear inventory</button>
+    </div>
     {% else %}
     <p style="color:#6b7280">No assets yet — run a network scan.</p>
     {% endif %}
+  </div>
+  </section>
+  {% endif %}
+
+  {% if 'scan' in perms %}
+  <section class="tab" id="tab-recon">
+  <div class="card">
+    <h2>OSINT recon (theHarvester-style)</h2>
+    <p class="note">Maps a domain's public footprint — subdomains (Certificate Transparency), DNS records, resolved hosts/IPs, and optionally Shodan/Hunter.io enrichment. Discovered hosts are added to the Assets inventory.</p>
+    <div class="warn">Only enumerate domains you own or are explicitly authorized to assess.</div>
+    <form id="recon-form">
+      <div class="grid3">
+        <div><label>Domain</label><input name="domain" placeholder="example.com"></div>
+        <div></div>
+        <div></div>
+      </div>
+      <div class="row"><label>Depth</label>
+        <div class="presets">
+          <label><input type="checkbox" name="fingerprint" checked> Web technology fingerprinting</label>
+          <label><input type="checkbox" name="ip_intel" checked> IP intelligence (ASN / geo / rDNS)</label>
+        </div>
+      </div>
+      <div class="row"><label>Optional vendor enrichment (needs API key in .env)</label>
+        <div class="presets">
+          <label><input type="checkbox" name="use_shodan"> Shodan (host/port/vulns)</label>
+          <label><input type="checkbox" name="use_hunter"> Hunter.io (emails)</label>
+        </div>
+      </div>
+      <div class="check"><input type="checkbox" id="recon-auth" name="authorized"><label for="recon-auth" style="margin:0">I am authorized to assess this domain.</label></div>
+      <button id="recon-btn" type="submit">Start recon</button>
+      <span id="rc-state" class="pill" style="display:none"></span>
+    </form>
+    <div id="rc-console" class="console"></div>
+    <div id="rc-actions" style="margin-top:10px"></div>
   </div>
   </section>
   {% endif %}
@@ -1359,7 +1556,7 @@ _PAGE = """<!DOCTYPE html>
     <ul class="reports" id="report-list">
       {% for r in reports %}
         <li data-file="{{ r.filename }}">
-          <span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','briefing':'Briefing'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
+          <span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
           <span class="actions">
             <button class="pv" type="button" data-file="{{ r.filename }}">Preview</button>
             <a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a>
@@ -1376,26 +1573,6 @@ _PAGE = """<!DOCTYPE html>
     </ul>
     {% if reports %}<button id="clear-btn" type="button">Clear all history</button>{% endif %}
     <iframe id="preview" title="Briefing preview"></iframe>
-  </div>
-  </section>
-
-  <section class="tab" id="tab-assistant">
-  <div class="card">
-    <h2>AI security assistant</h2>
-    <p class="note">Ask about vulnerabilities, business impact, or remediation. Optionally ground the chat in one of your reports, then ask "explain the risks" or "write a script to fix this".</p>
-    <div class="grid3">
-      <div><label>Ground in report (optional)</label>
-        <select id="ai-report"><option value="">None — general questions</option>
-          {% for r in reports %}<option value="{{ r.filename }}">{{ r.filename }}</option>{% endfor %}
-        </select>
-      </div>
-    </div>
-    <div id="ai-chat" class="aichat"></div>
-    <form id="ai-form" style="display:flex; gap:8px; margin-top:10px">
-      <input id="ai-input" placeholder="e.g. How do I remediate CVE-2021-34527 on Windows?" style="flex:1">
-      <button id="ai-send" type="submit" style="margin-top:0">Send</button>
-    </form>
-    <div class="note">Try: "Explain the risks in this scan" · "Generate a PowerShell script to disable SMBv1" · "What's the business impact?"</div>
   </div>
   </section>
 
@@ -1517,6 +1694,19 @@ _PAGE = """<!DOCTYPE html>
   {% endif %}
 
 </div>
+</div>
+</div>
+
+<button id="ai-fab" type="button" title="AI security assistant" aria-label="AI security assistant">&#128172;</button>
+<div id="ai-widget" role="dialog" aria-label="AI security assistant">
+  <div class="ai-head"><span>AI security assistant</span><button id="ai-close" type="button" aria-label="Close">&times;</button></div>
+  <div class="ai-body">
+    <select id="ai-report"><option value="">Ground in a report (optional)</option>{% for r in reports %}<option value="{{ r.filename }}">{{ r.filename }}</option>{% endfor %}</select>
+    <div id="ai-chat" class="aichat"></div>
+    <form id="ai-form"><input id="ai-input" placeholder="Ask about a vuln or remediation…"><button id="ai-send" type="submit">Send</button></form>
+  </div>
+</div>
+
 <script>
 window.__ALL_PRIVS = [{% for k,lbl in all_privileges %}["{{ k }}","{{ lbl }}"]{% if not loop.last %},{% endif %}{% endfor %}];
 const _fetch = window.fetch;
@@ -1550,6 +1740,17 @@ document.querySelectorAll('.ms').forEach(ms => {
   summary();
 });
 document.addEventListener('click', () => document.querySelectorAll('.ms.open').forEach(o => o.classList.remove('open')));
+
+// AI assistant popup toggle
+const aiFab = document.getElementById('ai-fab');
+const aiWidget = document.getElementById('ai-widget');
+if (aiFab && aiWidget) {
+  aiFab.addEventListener('click', () => {
+    aiWidget.classList.toggle('open');
+    if (aiWidget.classList.contains('open')) document.getElementById('ai-input').focus();
+  });
+  document.getElementById('ai-close').addEventListener('click', () => aiWidget.classList.remove('open'));
+}
 </script>
 <script>
 const freq = document.getElementById('freq');
@@ -1585,8 +1786,8 @@ if (stopBtn) stopBtn.addEventListener('click', async () => {
 });
 
 function rowHtml(f, owner) {
-  const kind = f.indexOf('analysis-') === 0 ? 'analysis' : (f.indexOf('scan-') === 0 ? 'scan' : 'briefing');
-  const label = kind === 'analysis' ? 'Analysis' : (kind === 'scan' ? 'Scan' : 'Briefing');
+  const kind = f.indexOf('analysis-') === 0 ? 'analysis' : (f.indexOf('scan-') === 0 ? 'scan' : (f.indexOf('recon-') === 0 ? 'recon' : 'briefing'));
+  const label = kind === 'analysis' ? 'Analysis' : (kind === 'scan' ? 'Scan' : (kind === 'recon' ? 'Recon' : 'Briefing'));
   const by = owner ? '<span class="by">by ' + owner + '</span>' : '';
   return '<span class="name"><span class="kind ' + kind + '">' + label + '</span>' +
          '<a href="/reports/' + f + '" target="_blank">' + f + '</a>' + by + '</span>' +
@@ -1738,6 +1939,66 @@ async function pollAnalyze(jobId) {
   }
 }
 
+// vendor lookup (key discovery)
+const vform = document.getElementById('vendor-form');
+if (vform) {
+  const vbtn = document.getElementById('vendor-btn');
+  const vstate = document.getElementById('v-state');
+  const vres = document.getElementById('vendor-result');
+  const VLEVEL = {
+    malicious: ['#7f1d1d', '#fca5a5', 'Malicious'], suspicious: ['#78350f', '#fcd34d', 'Suspicious'],
+    info: ['#1e3a5f', '#93c5fd', 'Info'], clean: ['#14432a', '#86efac', 'Clean'],
+    error: ['#3f1d1d', '#f87171', 'Error']
+  };
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  vform.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!document.getElementById('vendor-key').value.trim()) { alert('Paste a vendor API key.'); return; }
+    const hasInd = document.getElementById('vendor-indicator').value.trim();
+    const hasFile = document.getElementById('vendor-file').files.length;
+    if (!hasInd && !hasFile) { alert('Enter an indicator or choose a file.'); return; }
+    vbtn.disabled = true; vres.innerHTML = '';
+    vstate.style.display = 'inline'; vstate.textContent = 'detecting vendor…'; vstate.className = 'pill';
+    let d;
+    try {
+      const res = await fetch('/vendor-analyze', { method:'POST', body: new FormData(vform) });
+      d = await res.json();
+      if (!res.ok && !d.vendor) { vstate.textContent = 'error'; vstate.className = 'pill err'; vres.innerHTML = '<p class="err">' + esc(d.error || 'Analysis failed.') + '</p>'; vbtn.disabled = false; return; }
+    } catch (err) {
+      vstate.textContent = 'error'; vstate.className = 'pill err'; vres.innerHTML = '<p class="err">Error: ' + esc(err) + '</p>'; vbtn.disabled = false; return;
+    }
+    let html = '';
+    if (d.vendor) html += '<div class="note" style="margin-bottom:8px">Detected vendor: <b>' + esc(d.vendor) + '</b>'
+                        + (d.indicator ? ' · target <code>' + esc(d.indicator) + '</code>' : '')
+                        + (d.type ? ' · ' + esc(d.type) : '') + '</div>';
+    if (d.error) {
+      vstate.textContent = d.vendor ? 'vendor mismatch' : 'not recognized'; vstate.className = 'pill err';
+      html += '<p class="err">' + esc(d.error) + '</p>';
+      vres.innerHTML = html; vbtn.disabled = false; return;
+    }
+    vstate.textContent = 'done'; vstate.className = 'pill ok';
+    if (d.hashes) html += '<div class="note" style="margin-bottom:8px">SHA256 <code>' + esc(d.hashes.sha256) + '</code></div>';
+    if (d.rows && d.rows.length) {
+      html += '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:2px solid var(--line)">' +
+              '<th style="padding:8px">Vendor</th><th style="padding:8px">Verdict</th><th style="padding:8px">Details</th><th style="padding:8px"></th></tr>';
+      d.rows.forEach(r => {
+        const lv = VLEVEL[r.level] || VLEVEL.info;
+        const link = r.link ? '<a href="' + esc(r.link) + '" target="_blank">Open</a>' : '';
+        html += '<tr style="border-bottom:1px solid var(--line)">' +
+          '<td style="padding:8px;font-weight:600">' + esc(r.vendor) + '</td>' +
+          '<td style="padding:8px"><span class="badge" style="background:' + lv[0] + ';color:' + lv[1] + '">' + lv[2] + '</span> ' + esc(r.summary) + '</td>' +
+          '<td style="padding:8px;color:var(--muted)">' + esc(r.detail) + '</td>' +
+          '<td style="padding:8px">' + link + '</td></tr>';
+      });
+      html += '</table>';
+    } else {
+      html += '<p class="note">No result returned for this indicator.</p>';
+    }
+    vres.innerHTML = html;
+    vbtn.disabled = false;
+  });
+}
+
 // network scan
 const scanForm = document.getElementById('scan-form');
 if (scanForm) {
@@ -1816,6 +2077,67 @@ if (aiForm) {
     }
     sendBtn.disabled = false; input.focus();
   });
+}
+
+// One-click: scan the hosts discovered by a recon run (prefills the Network scan form)
+function scanDiscovered(targets, count) {
+  if (!confirm('Start a network scan of ' + count + ' discovered host(s)? '
+      + 'Only proceed if you are authorized to scan these systems.')) return;
+  const btn = document.querySelector('.tabbtn[data-tab="tab-scan"]');
+  const sf = document.getElementById('scan-form');
+  if (!btn || !sf) { alert('Network scan is not available for your account.'); return; }
+  btn.click();  // switch to the Network scan tab
+  sf.querySelector('[name=target]').value = targets;
+  const mode = document.getElementById('scan-mode');
+  mode.value = 'advanced'; mode.dispatchEvent(new Event('change'));
+  const corr = sf.querySelector('[name=correlate_cves]'); if (corr) corr.checked = true;
+  document.getElementById('scan-auth').checked = true;
+  sf.requestSubmit();
+}
+
+// OSINT recon
+const reconForm = document.getElementById('recon-form');
+if (reconForm) {
+  const rbtn = document.getElementById('recon-btn');
+  const rcon = document.getElementById('rc-console');
+  const rstate = document.getElementById('rc-state');
+  reconForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!document.getElementById('recon-auth').checked) { alert('Please confirm you are authorized to assess this domain.'); return; }
+    rbtn.disabled = true; rcon.style.display = 'block'; rcon.textContent = '';
+    rstate.style.display = 'inline'; rstate.textContent = 'running...'; rstate.className = 'pill';
+    const res = await fetch('/recon', { method:'POST', body: new FormData(reconForm) });
+    if (!res.ok) { let m='recon failed'; try { m=(await res.json()).error||m; } catch(e){} rstate.textContent='error'; rstate.className='pill err'; rcon.textContent=m; rbtn.disabled=false; return; }
+    pollRecon((await res.json()).job_id);
+  });
+  async function pollRecon(jobId) {
+    try {
+      const job = await (await fetch('/status/' + jobId)).json();
+      rcon.textContent = (job.logs || []).join('\\n'); rcon.scrollTop = rcon.scrollHeight;
+      if (job.status === 'running') { setTimeout(() => pollRecon(jobId), 1200); return; }
+      rbtn.disabled = false;
+      if (job.status === 'done') {
+        rstate.textContent = 'done'; rstate.className = 'pill ok';
+        rcon.textContent += '\\n\\nRecon report ready: ' + job.report.title;
+        addReportRow(job.report.filename, job.report.owner);
+        window.open('/reports/' + job.report.filename, '_blank');
+        const acts = document.getElementById('rc-actions');
+        acts.innerHTML = '';
+        if (job.report.targets && job.report.target_count > 0) {
+          const b = document.createElement('button');
+          b.type = 'button'; b.textContent = 'Scan ' + job.report.target_count + ' discovered host(s)';
+          b.onclick = () => scanDiscovered(job.report.targets, job.report.target_count);
+          acts.appendChild(b);
+        }
+      } else {
+        rstate.textContent = 'error'; rstate.className = 'pill err';
+        rcon.textContent += '\\n\\nError: ' + (job.error || 'unknown');
+      }
+    } catch (err) {
+      rbtn.disabled = false; rstate.textContent = 'error'; rstate.className = 'pill err';
+      rcon.textContent += '\\n\\nError: ' + err;
+    }
+  }
 }
 
 // scheduled scan

@@ -8,6 +8,8 @@ import os
 import re
 from urllib.parse import quote
 
+import apikeys
+
 log = logging.getLogger("analysis.iocs")
 
 # Common defang patterns -> real form, so [.] / hxxp / [@] etc. are detected.
@@ -140,7 +142,7 @@ def reputation(kind: str, ind: str, enrich_budget: list[int]) -> str:
     """Reputation cell: live VT score if VT_API_KEY is set (within budget),
     otherwise a clickable lookup link. enrich_budget is a 1-item list used as a
     mutable counter so we respect VT free-tier rate limits."""
-    api_key = os.getenv("VT_API_KEY", "")
+    api_key = apikeys.get("VT_API_KEY")
     if api_key and kind in {"ipv4", "domain", "md5", "sha1", "sha256"} and enrich_budget[0] > 0:
         enrich_budget[0] -= 1
         score = _vt_score(kind, ind, api_key)

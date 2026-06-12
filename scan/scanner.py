@@ -38,22 +38,27 @@ MAX_PORTS = 2048
 
 
 def expand_targets(target: str, max_hosts: int = MAX_HOSTS) -> list[str]:
+    """Accept a single host/IP/CIDR/hostname or a comma-separated list of them."""
     target = (target or "").strip()
     if not target:
         raise ValueError("No target supplied.")
-    if "/" in target:
-        net = ipaddress.ip_network(target, strict=False)
-        hosts = [str(h) for h in net.hosts()] or [str(net.network_address)]
-    else:
-        try:
-            ipaddress.ip_address(target)
-            hosts = [target]
-        except ValueError:
-            hosts = [socket.gethostbyname(target)]  # resolve hostname
-    if len(hosts) > max_hosts:
-        raise ValueError(f"Target expands to {len(hosts)} hosts; the limit is "
+    hosts: list[str] = []
+    for piece in (p.strip() for p in target.split(",") if p.strip()):
+        if "/" in piece:
+            net = ipaddress.ip_network(piece, strict=False)
+            hosts += [str(h) for h in net.hosts()] or [str(net.network_address)]
+        else:
+            try:
+                ipaddress.ip_address(piece)
+                hosts.append(piece)
+            except ValueError:
+                hosts.append(socket.gethostbyname(piece))  # resolve hostname
+    seen: set[str] = set()
+    uniq = [h for h in hosts if not (h in seen or seen.add(h))]
+    if len(uniq) > max_hosts:
+        raise ValueError(f"Target expands to {len(uniq)} hosts; the limit is "
                          f"{max_hosts}. Use a smaller range.")
-    return hosts
+    return uniq
 
 
 def parse_ports(spec: str, default: list[int]) -> list[int]:
@@ -145,7 +150,7 @@ def run_nmap(target: str, version: bool = True, vuln: bool = False,
         args += ["-p", ports]
     else:
         args += ["--top-ports", str(top_ports)]
-    args.append(target)
+    args += [t.strip() for t in target.split(",") if t.strip()]  # nmap takes targets as separate args
     log.info("Running nmap: %s", " ".join(args))
     proc = subprocess.run(args, capture_output=True, text=True, timeout=1800)
     try:

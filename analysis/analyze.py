@@ -6,6 +6,7 @@ import logging
 import os
 
 from agent.llm import build_client
+from .enrich import sections_markdown
 from .extract import extract_text
 from .iocs import extract_iocs, ioc_table_markdown, refang
 
@@ -90,6 +91,14 @@ def analyze_document(path: str, cfg) -> str:
         body = body.replace("[[IOCS]]", ioc_md)
     else:
         body += "\n\n" + ioc_md
+
+    # Vendor-API enrichment: file hashes + VirusTotal file verdict + IOC reputation
+    try:
+        vendor = sections_markdown(path, iocs)
+        if vendor.strip():
+            body += "\n\n" + vendor
+    except Exception:
+        log.exception("vendor enrichment failed")
 
     header = f"# Threat Analysis — {name}\n\n"
     return header + body

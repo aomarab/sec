@@ -155,6 +155,14 @@ def _inline(text: str) -> str:
     return text
 
 
+def to_html(markdown: str, title: str = "Report", heading: str | None = None) -> str:
+    """Render markdown to a standalone, styled HTML string (no file written)."""
+    now = datetime.now(timezone.utc)
+    return _HTML_SHELL.format(
+        title=title, heading=heading or title,
+        generated=now.strftime("%Y-%m-%d %H:%M"), body=_md_to_html(markdown))
+
+
 def render(markdown: str, prefix: str = "briefing") -> dict:
     """Persist markdown + HTML; return paths and the rendered HTML.
     `prefix` distinguishes report types in the filename (briefing | analysis)."""
@@ -173,11 +181,7 @@ def render(markdown: str, prefix: str = "briefing") -> dict:
     with open(md_path, "w", encoding="utf-8") as fh:
         fh.write(markdown)
 
-    html = _HTML_SHELL.format(
-        title=title, heading=heading,
-        generated=now.strftime("%Y-%m-%d %H:%M"),
-        body=_md_to_html(markdown),
-    )
+    html = to_html(markdown, title=title, heading=heading)
     with open(html_path, "w", encoding="utf-8") as fh:
         fh.write(html)
 

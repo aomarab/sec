@@ -1,32 +1,26 @@
 services:
-  threat-intel-agent:
-    build: .
-    image: threat-intel-briefing-agent:latest
-    container_name: threat-intel-briefing-agent
-    env_file:
-      - .env
-    environment:
-      # Override here if you prefer compose over .env; .env wins if both set.
-      RUN_MODE: ${RUN_MODE:-schedule}
-    volumes:
-      - ./reports:/app/reports
-    restart: unless-stopped
-    # Lets the container reach a local Ollama on the host (LLM_PROVIDER=ollama)
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  # Browser UI — `docker compose up web`, then open http://localhost:5000
   web:
     build: .
     image: threat-intel-briefing-agent:latest
-    container_name: threat-intel-briefing-web
-    command: ["python", "webapp.py"]
+    container_name: threat-intel-briefing
     env_file:
       - .env
     ports:
       - "5000:5000"
     volumes:
-      - ./reports:/app/reports
+      # All persistent state (reports, users, schedules, assets, alerts, branding,
+      # session secret) lives here. Back this folder up to keep your data.
+      - ./data:/app/data
     restart: unless-stopped
+    # Lets the container reach services on the host (e.g. a local Ollama, or an
+    # SMTP relay) via host.docker.internal.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+    # ── Optional: scan the host's local network with nmap ──────────────────
+    # A bridged container can't see your LAN. To run real network scans against
+    # your local subnet on a Linux host, comment out the "ports" mapping above
+    # and uncomment the two lines below (host networking + raw-socket caps).
+    # The UI is then still reachable on http://localhost:5000.
+    # network_mode: host
+    # cap_add: ["NET_RAW", "NET_ADMIN"]
