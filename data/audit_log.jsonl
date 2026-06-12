@@ -1,2 +1,6 @@
 {"ts": "2026-06-12 19:21:51", "category": "system", "action": "Scheduler started", "user": "", "level": "info", "status": "", "detail": "logger: apscheduler.scheduler"}
 {"ts": "2026-06-12 19:21:51", "category": "system", "action": "Threat Intel Briefing web UI on http://localhost:5000", "user": "", "level": "info", "status": "", "detail": "logger: webapp"}
+{"ts": "2026-06-12 20:08:29", "category": "system", "action": "Scheduler started", "user": "", "level": "info", "status": "", "detail": "logger: apscheduler.scheduler"}
+{"ts": "2026-06-12 20:08:29", "category": "system", "action": "Threat Intel Briefing web UI on http://localhost:5000", "user": "", "level": "info", "status": "", "detail": "logger: webapp"}
+{"ts": "2026-06-12 20:10:01", "category": "admin", "action": "Update API keys", "user": "admin", "level": "info", "status": "", "detail": ""}
+{"ts": "2026-06-12 20:10:15", "category": "admin", "action": "Update API keys", "user": "admin", "level": "info", "status": "", "detail": ""}
