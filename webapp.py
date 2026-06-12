@@ -23,6 +23,7 @@ from flask import (Flask, abort, jsonify, redirect, render_template_string,
 from werkzeug.utils import secure_filename
 
 import alerts
+import apikeys
 import assistant
 import audit
 import auth
@@ -556,6 +557,7 @@ def index():
         scan_sched=_load_scan_sched(), next_scan_run=_next_scan_run(),
         alert_cfg=alerts.load_config() if auth.has_perm(user, "admin") else {},
         vendor_sections=[(k, v[0]) for k, v in cloud_vendor.SECTIONS.items()],
+        api_keys=apikeys.status() if auth.has_perm(user, "admin") else [],
     )
 
 
@@ -603,6 +605,14 @@ def admin_delete():
     if ok:
         _audit("admin", "Delete user", level="warning", detail=request.form.get("username", ""))
     return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/apikeys/save", methods=["POST"])
+@auth.require_perm("admin")
+def apikeys_save():
+    apikeys.save_form(request.form)
+    _audit("admin", "Update API keys", level="info")
+    return jsonify({"ok": True})
 
 
 @app.route("/admin/logs")
@@ -2260,6 +2270,23 @@ _PAGE = """<!DOCTYPE html>
   {% endif %}
   {% if is_admin %}
   <div class="card">
+    <h2>API keys</h2>
+    <p class="note">Store keys here instead of editing <code>.env</code> — they take effect immediately, no restart needed. Includes the LLM engine key (Anthropic/OpenAI) and vendor keys. Stored keys override <code>.env</code>. Leave a field blank to keep the current value; tick Clear to remove it. Keys are write-only (shown masked).</p>
+    <form id="keys-form">
+      {% for k in api_keys %}
+      <div class="row">
+        <label>{{ k.label }} — <span style="color:var(--muted)">{{ k.desc }}</span>{% if k.configured %} · <span class="ok">configured{% if k.hint %} ({{ k.hint }}){% endif %}</span>{% else %} · <span style="color:#f87171">not set</span>{% endif %}</label>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+          <input name="{{ k.key }}" type="password" autocomplete="off" placeholder="{% if k.configured %}enter to replace{% else %}paste API key{% endif %}" style="flex:1; min-width:240px">
+          {% if k.configured %}<label style="display:flex; align-items:center; gap:6px; font-size:12px; margin:0"><input type="checkbox" name="clear_{{ k.key }}" style="width:auto"> Clear</label>{% endif %}
+        </div>
+      </div>
+      {% endfor %}
+      <button type="submit">Save API keys</button>
+      <span id="keys-state" class="pill" style="display:none"></span>
+    </form>
+  </div>
+  <div class="card">
     <h2>Alerts</h2>
     <p class="note">Notify when a scan's findings meet the severity threshold. Webhook URLs come from Teams/Slack "Incoming Webhook" connectors.</p>
     <form id="alerts-form">
@@ -2380,15 +2407,21 @@ if (clockEl) {
 }
 
 // central tab switcher — used by sidebar nav and dashboard quick actions
-function activateTab(tabId) {
+function activateTab(tabId, remember) {
   const sec = document.getElementById(tabId);
   if (!sec) return;
   document.querySelectorAll('.tabbtn').forEach(x => x.classList.toggle('active', x.dataset.tab === tabId));
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
   sec.classList.add('active');
+  if (remember !== false) { try { localStorage.setItem('tiba_tab', tabId); } catch (e) {} }
   closeNav();
   window.scrollTo({ top: 0 });
 }
+// restore the last-viewed tab across reloads
+try {
+  const saved = localStorage.getItem('tiba_tab');
+  if (saved && document.getElementById(saved)) activateTab(saved, false);
+} catch (e) {}
 // event delegation so any current or future .tabbtn / .dash-jump works
 document.addEventListener('click', (e) => {
   const nav = e.target.closest('.tabbtn, .dash-jump');
@@ -3080,6 +3113,16 @@ if (assetsClear) assetsClear.addEventListener('click', async () => {
   if (!confirm('Clear the asset inventory?')) return;
   await fetch('/assets/clear', { method:'POST' });
   location.reload();
+});
+
+// API keys
+const keysForm = document.getElementById('keys-form');
+if (keysForm) keysForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  await fetch('/apikeys/save', { method:'POST', body: new FormData(keysForm) });
+  const s = document.getElementById('keys-state');
+  s.style.display = 'inline'; s.textContent = 'Saved'; s.className = 'pill ok';
+  setTimeout(() => location.reload(), 700);
 });
 
 // alerts config

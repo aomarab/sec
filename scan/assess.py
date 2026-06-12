@@ -363,11 +363,15 @@ def run_scan(opts: dict, cfg=CONFIG, progress=None) -> str:
     try:
         narrative = _llm_narrative(cfg, ctx, style).strip()
     except Exception as err:
-        log.exception("LLM narrative failed")
-        narrative = ("## Summary\nScan completed; automated narrative unavailable "
-                     f"({err}). Review the tables below.\n\n## Recommendations\n"
+        log.info("LLM narrative unavailable: %s", err)
+        es = str(err).lower()
+        why = ("the AI engine isn't configured — add a valid LLM API key in Settings → API keys"
+               if any(k in es for k in ("x-api-key", "authentication", "401", "api key", "unauthorized"))
+               else "the AI engine was unavailable")
+        narrative = (f"## Summary\nThe scan completed successfully; the AI-written summary was skipped "
+                     f"because {why}. All findings below are complete.\n\n## Recommendations\n"
                      "- Review each open port and close or firewall those not required.\n"
-                     "- Patch services with the potential CVEs listed below.")
+                     "- Patch services flagged with potential CVEs and remediate the findings above.")
 
     risk_line = (f"**Risk score: {score}/100 ({label})** · {counts['critical']} critical, "
                  f"{counts['high']} high, {counts['medium']} medium findings · "

@@ -13,11 +13,14 @@ KEYS_FILE = os.getenv("API_KEYS_FILE", "api_keys.json")
 
 # (env var name, display label, what it enables)
 VENDORS = [
+    ("ANTHROPIC_API_KEY", "Anthropic (Claude)", "LLM engine — briefings, analysis, scan/recon narratives, intel"),
+    ("OPENAI_API_KEY", "OpenAI", "Alternative LLM engine (when provider = openai)"),
     ("VT_API_KEY", "VirusTotal", "File / IP / domain / hash reputation"),
     ("ABUSEIPDB_API_KEY", "AbuseIPDB", "IP abuse reputation"),
     ("SHODAN_API_KEY", "Shodan", "Host / port / vuln data in recon"),
     ("HUNTER_API_KEY", "Hunter.io", "Email discovery in recon"),
     ("NVD_API_KEY", "NVD", "Higher rate limits for CVE lookups"),
+    ("WPSCAN_API_KEY", "WPScan", "WordPress vulnerability database"),
 ]
 _NAMES = {v[0] for v in VENDORS}
 
