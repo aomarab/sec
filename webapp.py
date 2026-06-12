@@ -24,6 +24,7 @@ from werkzeug.utils import secure_filename
 
 import alerts
 import assistant
+import audit
 import auth
 from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
@@ -34,6 +35,7 @@ from briefing import delivery, export, report
 from collectors import kev, nvd
 from config import CONFIG
 from scan import scanner as scan_scanner
+from scan import tools as scan_tools
 from scan.assess import run_scan
 from recon.harvester import run_recon
 from cloud import azure as azure_cloud
@@ -42,6 +44,19 @@ from cloud import vendor as cloud_vendor
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("webapp")
+audit.install_handler()  # capture app activity into the Logs tab
+
+
+def _audit(category, action, level="info", detail="", username=None):
+    """Record a user action in the activity log (resolves the current user)."""
+    try:
+        if username is None:
+            u = auth.current_user()
+            username = u["username"] if u else ""
+    except Exception:
+        username = username or ""
+    audit.record(category, action, user=username or "", level=level, detail=detail)
+
 
 app = Flask(__name__)
 app.secret_key = auth.get_secret_key()
@@ -459,9 +474,12 @@ def login():
     nxt = request.args.get("next", "/")
     logo, ver = bool(_logo_path()), _logo_ver()
     if request.method == "POST":
+        uname = request.form.get("username", "").strip()
         if auth.verify(request.form.get("username", ""), request.form.get("password", "")):
-            session["user"] = request.form.get("username", "").strip()
+            session["user"] = uname
+            audit.record("auth", "Sign in", user=uname, level="success")
             return redirect(request.form.get("next") or "/")
+        audit.record("auth", "Failed sign-in attempt", user=uname, level="warning")
         return render_template_string(_LOGIN, error="Invalid username or password.",
                                       next=nxt, logo=logo, logo_ver=ver)
     if auth.current_user():
@@ -471,6 +489,7 @@ def login():
 
 @app.route("/logout")
 def logout():
+    _audit("auth", "Sign out")
     session.clear()
     return redirect("/login")
 
@@ -531,6 +550,7 @@ def index():
         regions=_with_current(REGIONS, CONFIG.region, _load_schedule().get("region")),
         industries=_with_current(INDUSTRIES, CONFIG.industry, _load_schedule().get("industry")),
         nmap_ok=scan_scanner.nmap_available(),
+        tools_ok=scan_tools.available(),
         scan_stats=_latest_scan_stats(),
         assets=_list_assets() if "scan" in perms else [],
         scan_sched=_load_scan_sched(), next_scan_run=_next_scan_run(),
@@ -552,6 +572,8 @@ def admin_create():
     ok, msg = auth.create_user(request.form.get("username", ""),
                                request.form.get("password", ""),
                                request.form.getlist("privileges"))
+    if ok:
+        _audit("admin", "Create user", detail=request.form.get("username", ""))
     return jsonify({"ok": ok, "message": msg})
 
 
@@ -560,6 +582,9 @@ def admin_create():
 def admin_update():
     ok, msg = auth.update_privileges(request.form.get("username", ""),
                                      request.form.getlist("privileges"))
+    if ok:
+        _audit("admin", "Update user privileges",
+               detail=f"{request.form.get('username','')}: {', '.join(request.form.getlist('privileges'))}")
     return jsonify({"ok": ok, "message": msg})
 
 
@@ -575,7 +600,33 @@ def admin_password():
 @auth.require_perm("admin")
 def admin_delete():
     ok, msg = auth.delete_user(request.form.get("username", ""))
+    if ok:
+        _audit("admin", "Delete user", level="warning", detail=request.form.get("username", ""))
     return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/admin/logs")
+@auth.require_perm("admin")
+def admin_logs():
+    try:
+        limit = max(1, min(int(request.args.get("limit", 300)), 2000))
+    except (TypeError, ValueError):
+        limit = 300
+    events = audit.read(category=request.args.get("category", "").strip(),
+                        level=request.args.get("level", "").strip(),
+                        user=request.args.get("user", "").strip(),
+                        query=request.args.get("q", "").strip(), limit=limit)
+    return jsonify({"events": events, "count": len(events),
+                    "categories": audit.CATEGORIES, "levels": audit.LEVELS,
+                    "stats": audit.stats()})
+
+
+@app.route("/admin/logs/clear", methods=["POST"])
+@auth.require_perm("admin")
+def admin_logs_clear():
+    audit.clear()
+    _audit("admin", "Cleared activity log", level="warning")
+    return jsonify({"ok": True})
 
 
 @app.route("/account/password", methods=["POST"])
@@ -607,6 +658,7 @@ def run():
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None,
                         "error": None, "cancel": cancel}
+    _audit("briefing", "Generate briefing", detail=f"region={cfg.region}; industry={cfg.industry}")
     threading.Thread(target=_run_job, args=(job_id, cfg, email_to, cancel, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -669,6 +721,7 @@ def analyze():
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None,
                         "reports": None, "error": None}
+    _audit("analysis", "Analyze file(s)", detail=", ".join(os.path.basename(p) for p in paths)[:300])
     threading.Thread(target=_run_analyze_job, args=(job_id, paths, email_to, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -718,6 +771,7 @@ def cve_analyze():
     except Exception as err:
         log.exception("CVE analysis failed")
         return jsonify({"error": str(err)}), 500
+    _audit("intel", "CVE analysis", detail=cve_id)
     return jsonify(_save_intel(md, "cve", auth.current_user()["username"]))
 
 
@@ -732,6 +786,7 @@ def actor_profile():
     except Exception as err:
         log.exception("Actor profile failed")
         return jsonify({"error": str(err)}), 500
+    _audit("intel", "Threat actor profile", detail=name)
     return jsonify(_save_intel(md, "actor", auth.current_user()["username"]))
 
 
@@ -747,6 +802,7 @@ def hunt_generate():
     except Exception as err:
         log.exception("Hunt generation failed")
         return jsonify({"error": str(err)}), 500
+    _audit("intel", "Threat hunting queries", detail=f"{subject} ({platform})")
     return jsonify(_save_intel(md, "hunt", auth.current_user()["username"]))
 
 
@@ -853,6 +909,20 @@ def scan_route():
         "use_nmap": (f.get("use_nmap") == "on") if advanced else False,
         "vuln_scripts": (f.get("vuln_scripts") == "on") if advanced else False,
         "os_detect": (f.get("os_detect") == "on") if advanced else False,
+        "use_masscan": (f.get("use_masscan") == "on") if advanced else False,
+        "nuclei": (f.get("nuclei") == "on") if advanced else False,
+        "testssl": (f.get("testssl") == "on") if advanced else False,
+        "headers": (f.get("headers") == "on") if advanced else False,
+        "nikto": (f.get("nikto") == "on") if advanced else False,
+        "wapiti": (f.get("wapiti") == "on") if advanced else False,
+        "ffuf": (f.get("ffuf") == "on") if advanced else False,
+        "subfinder": (f.get("subfinder") == "on") if advanced else False,
+        "wpscan": (f.get("wpscan") == "on") if advanced else False,
+        "droopescan": (f.get("droopescan") == "on") if advanced else False,
+        "sqlmap": (f.get("sqlmap") == "on") if advanced else False,
+        "webchecks": (f.get("webchecks") == "on") if advanced else False,
+        "zap": (f.get("zap") == "on") if advanced else False,
+        "retire": (f.get("retire") == "on") if advanced else False,
         "timing": f.get("timing", "4") if advanced else "4",
         "report_style": f.get("report_style", "technical") if advanced else "technical",
     }
@@ -861,6 +931,7 @@ def scan_route():
     job_id = uuid.uuid4().hex[:12]
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    _audit("scan", "Network scan", detail=f"target={target}; mode={opts['mode']}")
     threading.Thread(target=_run_scan_job, args=(job_id, opts, email_to, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -905,11 +976,17 @@ def recon_route():
         return jsonify({"error": "Enter a domain, e.g. example.com"}), 400
     opts = {"use_shodan": f.get("use_shodan") == "on", "use_hunter": f.get("use_hunter") == "on",
             "fingerprint": f.get("fingerprint", "on") == "on",
-            "ip_intel": f.get("ip_intel", "on") == "on"}
+            "ip_intel": f.get("ip_intel", "on") == "on",
+            "use_subfinder": f.get("use_subfinder", "on") == "on",
+            "use_amass": f.get("use_amass") == "on",
+            "use_dnsx": f.get("use_dnsx", "on") == "on",
+            "use_httpx": f.get("use_httpx") == "on",
+            "use_urls": f.get("use_urls") == "on"}
     owner = auth.current_user()["username"]
     job_id = uuid.uuid4().hex[:12]
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    _audit("recon", "OSINT recon", detail=f"domain={domain}")
     threading.Thread(target=_run_recon_job, args=(job_id, domain, opts, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -966,11 +1043,14 @@ def cloud_azure():
              "subscription": (f.get("subscription") or "").strip()}
     if not (creds["tenant"] and creds["client_id"] and creds["secret"]):
         return jsonify({"error": "Enter the tenant ID, client ID, and client secret."}), 400
+    sections = f.getlist("sections")
     owner = auth.current_user()["username"]
     job_id = uuid.uuid4().hex[:12]
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
-    threading.Thread(target=_run_cloud_job, args=(job_id, creds, owner), daemon=True).start()
+    threading.Thread(target=_run_cloud_job, args=(job_id, creds, owner),
+                     kwargs={"sections": sections}, daemon=True).start()
+    _audit("cloud", "Azure assessment (service principal)", detail=f"tenant={creds['tenant']}")
     return jsonify({"job_id": job_id})
 
 
@@ -1012,7 +1092,9 @@ def cloud_azure_device_poll():
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
     threading.Thread(target=_run_cloud_job, args=(job_id, creds, owner),
-                     kwargs={"token": res["access_token"]}, daemon=True).start()
+                     kwargs={"token": res["access_token"], "sections": f.getlist("sections")},
+                     daemon=True).start()
+    _audit("cloud", "Azure assessment (signed-in)", detail=f"tenant={tenant}")
     return jsonify({"status": "ok", "job_id": job_id})
 
 
@@ -1050,6 +1132,7 @@ def cloud_vendor_assess():
     job_id = uuid.uuid4().hex[:12]
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    _audit("cloud", "Vendor security assessment", detail=provider)
     threading.Thread(target=_run_vendor_job, args=(job_id, provider, sections, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -1345,6 +1428,7 @@ def delete_report():
             os.remove(p)
             removed.append(os.path.basename(p))
     _remove_owners([stem + ".html"])
+    _audit("admin", "Delete report", level="warning", detail=stem)
     return jsonify({"ok": True, "removed": removed})
 
 
@@ -1364,6 +1448,7 @@ def clear_reports():
             os.remove(OWNERS_FILE)
         except OSError:
             pass
+    _audit("admin", "Clear all reports", level="warning", detail=f"{count} file(s) removed")
     return jsonify({"ok": True, "deleted": count})
 
 
@@ -1590,6 +1675,7 @@ _PAGE = """<!DOCTYPE html>
   <div class="nav-group">System</div>
   <button class="tabbtn" data-tab="tab-settings">Settings</button>
   {% if is_admin %}<button class="tabbtn" data-tab="tab-admin">Admin</button>{% endif %}
+  {% if is_admin %}<button class="tabbtn" data-tab="tab-logs">Logs</button>{% endif %}
 </aside>
 <div id="nav-scrim" class="scrim"></div>
 <div class="content">
@@ -1827,8 +1913,27 @@ _PAGE = """<!DOCTYPE html>
             <label><input type="checkbox" name="use_nmap"> Use nmap if installed {% if not nmap_ok %}(not detected){% endif %}</label>
             <label><input type="checkbox" name="vuln_scripts"> nmap vuln scripts</label>
             <label><input type="checkbox" name="os_detect"> OS detection (nmap)</label>
+            <label><input type="checkbox" name="use_masscan"> Fast discovery (masscan){% if not tools_ok.masscan %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="nuclei"> Template detection (nuclei){% if not tools_ok.nuclei %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="testssl"> TLS assessment (testssl.sh){% if not tools_ok.testssl %} (not detected){% endif %}</label>
           </div>
           {% if not nmap_ok %}<div class="note">nmap isn't installed on the server, so nmap options are ignored — the built-in scanner is used. Install nmap for service/version detection and vuln scripts.</div>{% endif %}
+        </div>
+        <div class="row"><label>Web application assessment (active — sends test requests to web services found)</label>
+          <div class="presets">
+            <label><input type="checkbox" name="headers" checked> Security headers / cookies / CORS</label>
+            <label><input type="checkbox" name="webchecks"> Deep checks: CORS / open-redirect / JWT / exposed secrets</label>
+            <label><input type="checkbox" name="zap"> OWASP ZAP (DAST){% if not tools_ok.zap %} (set ZAP_API_URL){% endif %}</label>
+            <label><input type="checkbox" name="retire"> Vulnerable JS libs (retire.js){% if not tools_ok.retire %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="nikto"> Nikto (misconfig / dangerous files){% if not tools_ok.nikto %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="wapiti"> Wapiti (XSS / SQLi / disclosure){% if not tools_ok.wapiti %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="ffuf"> Content discovery (ffuf){% if not tools_ok.ffuf %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="subfinder"> Subdomain enum (subfinder){% if not tools_ok.subfinder %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="wpscan"> WordPress (WPScan){% if not tools_ok.wpscan %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="droopescan"> Drupal (Droopescan){% if not tools_ok.droopescan %} (not detected){% endif %}</label>
+            <label><input type="checkbox" name="sqlmap"> SQLi detection (sqlmap){% if not tools_ok.sqlmap %} (not detected){% endif %}</label>
+          </div>
+          <div class="note">Tools not detected are skipped automatically (they ship in the Docker image). The web-app checks send test requests to discovered HTTP(S) services — run only against systems you own or are authorized to test, ideally non-production. Detection only: sqlmap confirms injectable parameters but does not dump data; no brute-force or password attacks.</div>
         </div>
       </div>
       <div class="check"><input type="checkbox" id="scan-auth" name="authorized"><label for="scan-auth" style="margin:0">I am authorized to scan this target.</label></div>
@@ -1905,10 +2010,20 @@ _PAGE = """<!DOCTYPE html>
         <div></div>
         <div></div>
       </div>
+      <div class="row"><label>Subdomain sources (passive OSINT)</label>
+        <div class="presets">
+          <label><input type="checkbox" checked disabled> Certificate Transparency (crt.sh)</label>
+          <label><input type="checkbox" name="use_subfinder" checked> subfinder (multi-source){% if not tools_ok.subfinder %} (not detected){% endif %}</label>
+          <label><input type="checkbox" name="use_amass"> amass passive (deeper){% if not tools_ok.amass %} (not detected){% endif %}</label>
+        </div>
+      </div>
       <div class="row"><label>Depth</label>
         <div class="presets">
           <label><input type="checkbox" name="fingerprint" checked> Web technology fingerprinting</label>
           <label><input type="checkbox" name="ip_intel" checked> IP intelligence (ASN / geo / rDNS)</label>
+          <label><input type="checkbox" name="use_dnsx" checked> Fast resolution (dnsx){% if not tools_ok.dnsx %} (not detected){% endif %}</label>
+          <label><input type="checkbox" name="use_httpx"> Live web triage (httpx){% if not tools_ok.httpx %} (not detected){% endif %}</label>
+          <label><input type="checkbox" name="use_urls"> Historical URLs (gau / Wayback){% if not tools_ok.gau %} (not detected){% endif %}</label>
         </div>
       </div>
       <div class="row"><label>Optional vendor enrichment (needs API key in .env)</label>
@@ -2200,6 +2315,26 @@ _PAGE = """<!DOCTYPE html>
       <button type="submit">Create user</button>
       <span id="nu-state" class="pill" style="display:none"></span>
     </form>
+  </div>
+  </section>
+  {% endif %}
+
+  {% if is_admin %}
+  <section class="tab" id="tab-logs">
+  <div class="card">
+    <h2>Activity log <span id="logs-meta" class="pill" style="display:none"></span></h2>
+    <p class="note">Everything that happens in the application — sign-ins, scans, recon, cloud and vendor assessments, briefings, deletions, and admin changes — plus the app's own system events. Newest first.</p>
+    <div class="grid3">
+      <div><label>Category</label><select id="logf-category"><option value="">All categories</option></select></div>
+      <div><label>Level</label><select id="logf-level"><option value="">All levels</option></select></div>
+      <div><label>User</label><input id="logf-user" placeholder="filter by user"></div>
+      <div style="grid-column:span 2"><label>Search</label><input id="logf-q" placeholder="search action / detail"></div>
+      <div style="display:flex;align-items:flex-end;gap:8px">
+        <button id="logs-refresh" type="button" style="margin:0">Refresh</button>
+        <button id="logs-clear" type="button" class="secondary" style="margin:0">Clear log</button>
+      </div>
+    </div>
+    <div id="logs-table" style="margin-top:14px"><p class="note">Loading…</p></div>
   </div>
   </section>
   {% endif %}
@@ -3039,6 +3174,58 @@ if (userTable) {
       if (!confirm('Remove the company logo?')) return;
       const d = await (await fetch('/admin/logo/delete', { method:'POST' })).json();
       if (d.ok) location.reload();
+    });
+  }
+
+  // ── Activity log (admin) ──
+  const logsTable = document.getElementById('logs-table');
+  if (logsTable) {
+    const LVL = { error:['#7f1d1d','#fca5a5'], warning:['#78350f','#fcd34d'],
+                  success:['#14432a','#86efac'], info:['#1e3a5f','#93c5fd'] };
+    const esc = (s) => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    const fcat = document.getElementById('logf-category');
+    const flvl = document.getElementById('logf-level');
+    const fuser = document.getElementById('logf-user');
+    const fq = document.getElementById('logf-q');
+    const meta = document.getElementById('logs-meta');
+    let filled = false;
+    async function loadLogs() {
+      logsTable.innerHTML = '<p class="note">Loading…</p>';
+      const qs = new URLSearchParams({ category:fcat.value, level:flvl.value, user:fuser.value, q:fq.value, limit:'500' });
+      let d;
+      try { d = await (await fetch('/admin/logs?' + qs)).json(); }
+      catch (e) { logsTable.innerHTML = '<p class="err">Couldn\\'t load the log.</p>'; return; }
+      if (!filled) {
+        (d.categories||[]).forEach(c => fcat.insertAdjacentHTML('beforeend', '<option value="'+c+'">'+c+'</option>'));
+        (d.levels||[]).forEach(l => flvl.insertAdjacentHTML('beforeend', '<option value="'+l+'">'+l+'</option>'));
+        filled = true;
+      }
+      meta.style.display='inline'; meta.textContent = d.count + ' event(s)';
+      const ev = d.events || [];
+      if (!ev.length) { logsTable.innerHTML = '<p class="note">No matching events.</p>'; return; }
+      let h = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:2px solid var(--line)">' +
+              '<th style="padding:8px">Time (UTC)</th><th style="padding:8px">Category</th><th style="padding:8px">Level</th>' +
+              '<th style="padding:8px">User</th><th style="padding:8px">Action</th><th style="padding:8px">Detail</th></tr>';
+      ev.forEach(e => {
+        const lv = LVL[e.level] || LVL.info;
+        h += '<tr style="border-bottom:1px solid var(--line)">' +
+          '<td style="padding:8px;white-space:nowrap;color:var(--muted)">' + esc(e.ts) + '</td>' +
+          '<td style="padding:8px"><span class="kind cloud">' + esc(e.category) + '</span></td>' +
+          '<td style="padding:8px"><span class="badge" style="background:'+lv[0]+';color:'+lv[1]+'">' + esc(e.level) + '</span></td>' +
+          '<td style="padding:8px">' + (esc(e.user) || '—') + '</td>' +
+          '<td style="padding:8px">' + esc(e.action) + '</td>' +
+          '<td style="padding:8px;color:var(--muted)">' + esc(e.detail) + '</td></tr>';
+      });
+      logsTable.innerHTML = h + '</table>';
+    }
+    document.addEventListener('click', (e) => { if (e.target.closest('[data-tab="tab-logs"]')) loadLogs(); });
+    document.getElementById('logs-refresh').addEventListener('click', loadLogs);
+    [fcat, flvl].forEach(el => el.addEventListener('change', loadLogs));
+    let t; [fuser, fq].forEach(el => el.addEventListener('input', () => { clearTimeout(t); t = setTimeout(loadLogs, 400); }));
+    document.getElementById('logs-clear').addEventListener('click', async () => {
+      if (!confirm('Clear the entire activity log? This cannot be undone.')) return;
+      await fetch('/admin/logs/clear', { method:'POST' });
+      loadLogs();
     });
   }
 }

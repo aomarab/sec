@@ -1,0 +1,14 @@
+Threat Intelligence Briefing Agent — build 2026-06-12
+
+Latest features in this build (verify these exist after deploying):
+- Dashboard home tab (Status moved here) + live UTC clock in top bar
+- Latest CVEs tab + dashboard feed (NVD + KEV, cached)
+- Threat Intel tab: CVE analysis, threat-actor profiles, hunting (KQL)
+- Cloud Posture tab with provider sub-tabs: Azure / AWS / GCP
+    * Azure: ONE button "Run Azure assessment" = tenant CSPM (sign-in or
+      service principal) + selectable vendor checks, merged into one report
+    * Vendor security assessment with 10 user-selectable checks
+    * Per-provider assessment history inside each sub-tab
+    * Friendly "AI engine not configured" message on bad/missing API key
+- Vendor lookup (paste an API key, auto-detects the vendor) under Analyze
+- Mobile hamburger menu; collapsible Settings sections; logo in top bar

@@ -24,3 +24,19 @@ services:
     # The UI is then still reachable on http://localhost:5000.
     # network_mode: host
     # cap_add: ["NET_RAW", "NET_ADMIN"]
+
+    # ── Optional: enable the OWASP ZAP DAST option ─────────────────────────
+    # Uncomment the env var below AND the `zap` service to turn on the
+    # "OWASP ZAP (DAST)" web-scan option. The app talks to ZAP's daemon API.
+    # environment:
+    #   - ZAP_API_URL=http://zap:8090
+
+  # Uncomment to run OWASP ZAP as a sibling daemon (pulls a large image).
+  # zap:
+  #   image: zaproxy/zap-stable:latest
+  #   container_name: threat-intel-zap
+  #   command: >
+  #     zap.sh -daemon -host 0.0.0.0 -port 8090
+  #     -config api.disablekey=true -config api.addrs.addr.name=.*
+  #     -config api.addrs.addr.regex=true
+  #   restart: unless-stopped

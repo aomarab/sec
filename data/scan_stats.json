@@ -1,0 +1,18 @@
+{
+  "scan-20260612-182904.html": {
+    "target": "192.168.100.3",
+    "hosts_up": 1,
+    "open_ports": 10,
+    "counts": {
+      "critical": 0,
+      "high": 0,
+      "medium": 2,
+      "low": 0,
+      "info": 0
+    },
+    "cves": 0,
+    "kev": 0,
+    "risk": 16,
+    "label": "Low"
+  }
+}

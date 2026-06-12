@@ -2,6 +2,11 @@
   "admin": {
     "password_hash": "scrypt:32768:8:1$TS4UEfrxlGzLA6ir$4ed53ddce2ff10110bc1068c7956e810a7366809959cd05be2e579ca8f6734b274742cea832f5b93f0cf1de0f9833f2dcbc7f0bcd607a245ff9521f117ae7e32",
     "privileges": [
+      "generate",
+      "analyze",
+      "scan",
+      "schedule",
+      "delete",
       "admin"
     ]
   }

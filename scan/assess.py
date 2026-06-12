@@ -10,7 +10,7 @@ import apikeys
 from agent.llm import build_client
 from collectors import kev, nvd
 from config import CONFIG
-from . import checks, scanner
+from . import checks, headers, scanner, tools, webchecks
 
 log = logging.getLogger("scan.assess")
 
@@ -190,6 +190,25 @@ def run_scan(opts: dict, cfg=CONFIG, progress=None) -> str:
         grab = opts.get("grab_banner", True)
         results = scanner.tcp_scan(hosts, ports, grab=grab, progress=progress)
 
+    # Optional fast port discovery with masscan (merged into results).
+    if advanced and opts.get("use_masscan"):
+        if tools.available()["masscan"]:
+            log.info("Running masscan port discovery...")
+            ms = tools.masscan_ports(target, ports=opts.get("ports") or "1-1024",
+                                     rate=opts.get("masscan_rate", "1000"))
+            by_host = {h["host"]: h for h in results}
+            for r in ms:
+                h = by_host.get(r["host"])
+                if h is None:
+                    h = {"host": r["host"], "open": []}
+                    results.append(h)
+                    by_host[r["host"]] = h
+                if not any(p["port"] == r["port"] for p in h["open"]):
+                    h["open"].append({"port": r["port"], "service": "unknown", "banner": ""})
+            log.info("masscan: %d open port record(s)", len(ms))
+        else:
+            log.info("masscan requested but not installed; skipped.")
+
     open_count = sum(len(h["open"]) for h in results)
     hosts_up = sum(1 for h in results if h["open"])
     log.info("Scan complete: %d open port(s) across %d responsive host(s)", open_count, hosts_up)
@@ -205,6 +224,92 @@ def run_scan(opts: dict, cfg=CONFIG, progress=None) -> str:
         if products:
             log.info("Correlating CVEs for: %s", ", ".join(products))
             cve_rows = _correlate(products)
+
+    # ── Optional web-app assessment + recon tools (advanced; authorized target) ──
+    web_urls, tls_eps = [], []
+    for h in results:
+        for p in h["open"]:
+            port, svc = p["port"], (p.get("service") or "").lower()
+            if port in (443, 8443) or any(k in svc for k in ("https", "ssl", "tls")):
+                web_urls.append(f"https://{h['host']}:{port}")
+                tls_eps.append(f"{h['host']}:{port}")
+            elif port in (80, 8080, 8000, 8888, 5000) or "http" in svc:
+                web_urls.append(f"http://{h['host']}:{port}")
+            elif port in (993, 995, 465, 636, 990, 5061):
+                tls_eps.append(f"{h['host']}:{port}")
+    web_urls = sorted(set(web_urls))
+    tls_eps = sorted(set(tls_eps))
+
+    nuclei_findings: list[dict] = []
+    testssl_findings: list[dict] = []
+    web_findings: list[dict] = []   # headers/nikto/wapiti/wpscan/droopescan/sqlmap
+    content_findings: list[dict] = []
+    subdomains: list[str] = []
+
+    def _adv(opt):
+        return advanced and opts.get(opt)
+
+    if _adv("nuclei") and web_urls:
+        log.info("Running nuclei against %d web endpoint(s)...", len(web_urls))
+        nuclei_findings = tools.run_nuclei(web_urls)
+    if _adv("testssl"):
+        for ep in tls_eps[:5]:
+            log.info("Running testssl on %s...", ep)
+            testssl_findings += tools.run_testssl(ep)
+    if _adv("headers") and web_urls:
+        log.info("Grading security headers on %d endpoint(s)...", len(web_urls))
+        for f in headers.grade_endpoints(web_urls):
+            web_findings.append({**f, "source": "headers", "name": f["issue"]})
+    if _adv("nikto"):
+        for u in web_urls[:2]:
+            log.info("Running nikto on %s...", u)
+            for f in tools.run_nikto(u):
+                web_findings.append({**f, "source": "nikto"})
+    if _adv("wapiti"):
+        for u in web_urls[:2]:
+            log.info("Running wapiti on %s...", u)
+            for f in tools.run_wapiti(u):
+                web_findings.append({**f, "source": "wapiti"})
+    if _adv("wpscan"):
+        for u in web_urls[:2]:
+            log.info("Running WPScan on %s...", u)
+            for f in tools.run_wpscan(u, api_token=apikeys.get("WPSCAN_API_KEY")):
+                web_findings.append({**f, "source": "wpscan"})
+    if _adv("droopescan"):
+        for u in web_urls[:2]:
+            log.info("Running droopescan on %s...", u)
+            for f in tools.run_droopescan(u):
+                web_findings.append({**f, "source": "droopescan"})
+    if _adv("sqlmap"):
+        for u in web_urls[:2]:
+            log.info("Running sqlmap (detection only) on %s...", u)
+            for f in tools.run_sqlmap_detect(u):
+                web_findings.append({**f, "source": "sqlmap"})
+    if _adv("webchecks") and web_urls:
+        log.info("Running native web checks (CORS/redirect/JWT/secrets)...")
+        for f in webchecks.run_endpoints(web_urls):
+            web_findings.append({**f, "source": "webchecks"})
+    if _adv("zap"):
+        for u in web_urls[:2]:
+            log.info("Running OWASP ZAP (spider + passive) on %s...", u)
+            for f in tools.run_zap(u):
+                web_findings.append({**f, "source": "zap"})
+    if _adv("retire") and web_urls:
+        log.info("Checking for vulnerable JS libraries (retire.js)...")
+        for f in tools.run_retire(web_urls):
+            web_findings.append({**f, "source": "retire.js"})
+    if _adv("ffuf"):
+        for u in web_urls[:2]:
+            log.info("Running ffuf content discovery on %s...", u)
+            content_findings += tools.run_ffuf(u)
+    if _adv("subfinder"):
+        import re as _re
+        dom = _re.sub(r"^https?://", "", target.split(",")[0]).split("/")[0].split(":")[0]
+        if _re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom, _re.I) and not _re.match(r"^\d+\.\d+\.\d+\.\d+$", dom):
+            log.info("Running subfinder on %s...", dom)
+            subdomains = tools.run_subfinder(dom)
+    log.info("Web tools: %d web finding(s), %d path(s), %d subdomain(s)",
+             len(web_findings), len(content_findings), len(subdomains))
 
     # Build LLM context (compact)
     svc_lines = []
@@ -222,12 +327,30 @@ def run_scan(opts: dict, cfg=CONFIG, progress=None) -> str:
             for r in cve_rows)
     if findings:
         ctx += "\n\nnmap vuln-script findings:\n" + "\n".join(findings[:40])
+    if nuclei_findings:
+        ctx += "\n\nnuclei findings:\n" + "\n".join(
+            f"[{f['severity']}] {f['name']} ({f['host']})" for f in nuclei_findings[:40])
+    if testssl_findings:
+        ctx += "\n\nTLS (testssl) findings:\n" + "\n".join(
+            f"[{f['severity']}] {f['id']} ({f['host']})" for f in testssl_findings[:40])
+    if web_findings:
+        ctx += "\n\nWeb application findings:\n" + "\n".join(
+            f"[{f['severity']}] ({f['source']}) {f['name']}" for f in web_findings[:40])
+    if content_findings:
+        ctx += "\n\nContent discovery (ffuf):\n" + "\n".join(
+            f"{f['status']} {f['path']}" for f in content_findings[:40])
+    if subdomains:
+        ctx += f"\n\nSubdomains discovered: {len(subdomains)}"
 
     counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for f in sec_findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
     for r in cve_rows:
         sev = (r.get("severity") or "").lower()
+        if sev in counts:
+            counts[sev] += 1
+    for f in nuclei_findings + testssl_findings + web_findings:
+        sev = (f.get("severity") or "").lower()
         if sev in counts:
             counts[sev] += 1
     kev_count = sum(1 for r in cve_rows if r.get("kev"))
@@ -254,12 +377,54 @@ def run_scan(opts: dict, cfg=CONFIG, progress=None) -> str:
     if findings:
         fl = "\n".join(f"- {f}" for f in findings[:40])
         parts += ["", "## nmap Vulnerability Findings", "", fl]
+    if nuclei_findings:
+        nrows = ["| Severity | Finding | Host | Template |", "|---|---|---|---|"]
+        for f in nuclei_findings[:60]:
+            nrows.append(f"| {f['severity'].title()} | {f['name']} | `{f['host']}` | {f.get('template','')} |")
+        parts += ["", "## nuclei Findings (template-based detection)", ""] + nrows
+    if testssl_findings:
+        trows = ["| Severity | Check | Endpoint | Finding |", "|---|---|---|---|"]
+        for f in testssl_findings[:60]:
+            fnd = (f.get("finding") or "").replace("|", "\\|")
+            trows.append(f"| {f['severity'].title()} | {f['id']} | `{f['host']}` | {fnd} |")
+        parts += ["", "## TLS Assessment (testssl.sh)", ""] + trows
+    if web_findings:
+        wrows = ["| Severity | Source | Finding | Location |", "|---|---|---|---|"]
+        for f in web_findings[:80]:
+            nm = (f.get("name") or "").replace("|", "\\|")[:120]
+            wrows.append(f"| {f['severity'].title()} | {f['source']} | {nm} | `{f.get('host','')}` |")
+        parts += ["", "## Web Application Findings", "",
+                  "_Header/cookie/CORS grading, Nikto, Wapiti, WPScan, Droopescan, and sqlmap "
+                  "(detection only)._", ""] + wrows
+    if content_findings:
+        crows = ["| Status | Path | URL |", "|---|---|---|"]
+        for f in content_findings[:80]:
+            crows.append(f"| {f.get('status','')} | `{f.get('path','')}` | {f.get('url','')} |")
+        parts += ["", "## Content Discovery (ffuf)", ""] + crows
+    if subdomains:
+        parts += ["", "## Subdomains (subfinder)", "",
+                  f"_{len(subdomains)} discovered._", ""] + [f"- `{s}`" for s in subdomains[:100]]
     parts += ["", _cve_table(cve_rows)]
     if nmap_note:
         parts += ["", f"> nmap note: {nmap_note}"]
+    engines = ["nmap" if use_nmap else "built-in TCP connect scanner"]
+    if opts.get("use_masscan") and tools.available()["masscan"]:
+        engines.append("masscan (discovery)")
+    if nuclei_findings:
+        engines.append("nuclei (detection)")
+    if testssl_findings:
+        engines.append("testssl.sh (TLS)")
+    for opt, lbl in (("headers", "security headers"), ("nikto", "Nikto"), ("wapiti", "Wapiti"),
+                     ("ffuf", "ffuf (content)"), ("subfinder", "subfinder"),
+                     ("wpscan", "WPScan"), ("droopescan", "Droopescan"), ("sqlmap", "sqlmap (detect)"),
+                     ("webchecks", "CORS/redirect/JWT/secrets"), ("zap", "OWASP ZAP"),
+                     ("retire", "retire.js")):
+        if opts.get(opt):
+            engines.append(lbl)
     parts += ["", "## Scope & Method", "",
               f"- Scanned target: `{target}` ({hosts_up} responsive of {len(hosts)} host(s))",
-              f"- Engine: {'nmap' if use_nmap else 'built-in TCP connect scanner'}",
+              f"- Engines: {', '.join(engines)}",
+              "- Detection/recon only — no exploitation, brute-force, or password attacks.",
               "- CVEs are *potential* matches from service banners via NVD — verify before acting."]
     return {"markdown": "\n".join(parts), "stats": stats,
             "assets": _build_assets(results, sec_findings)}

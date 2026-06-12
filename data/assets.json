@@ -428,5 +428,32 @@
     "risk": 0,
     "label": "Minimal",
     "last_scan": "2026-06-12 08:56 UTC"
+  },
+  "192.168.100.3": {
+    "ip": "192.168.100.3",
+    "hostname": "",
+    "os": "",
+    "ports": [
+      135,
+      139,
+      445,
+      3000,
+      3001,
+      5000,
+      5357,
+      8000,
+      9090,
+      623
+    ],
+    "services": [
+      "http",
+      "microsoft-ds",
+      "msrpc",
+      "netbios-ssn",
+      "ppp"
+    ],
+    "risk": 16,
+    "label": "Low",
+    "last_scan": "2026-06-12 18:29 UTC"
   }
 }
