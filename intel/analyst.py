@@ -18,23 +18,40 @@ log = logging.getLogger("intel.analyst")
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,7}$", re.I)
 
 
+class LLMConfigError(RuntimeError):
+    """The LLM provider rejected the request due to a bad/missing API key or
+    misconfiguration — surfaced to the user as a clear, actionable message."""
+
+
+def _friendly_llm_error(err: Exception) -> Exception:
+    msg = str(err).lower()
+    if "x-api-key" in msg or "authentication" in msg or "401" in msg or "api key" in msg or "unauthorized" in msg:
+        return LLMConfigError(
+            "The AI engine isn't configured — the LLM API key is missing or invalid. "
+            "Set a valid ANTHROPIC_API_KEY (or configure another provider) in your .env and restart.")
+    return err
+
+
 # ── shared LLM completion (mirrors the scan/recon narrative helpers) ──────────
 def _complete(cfg, system: str, context: str, max_tokens: int = 2600) -> str:
-    client, model = build_client(cfg.llm)
-    if cfg.llm.provider == "anthropic":
-        kwargs = dict(model=model, max_tokens=max_tokens,
-                      system=[{"type": "text", "text": system,
-                               "cache_control": {"type": "ephemeral"}}],
-                      messages=[{"role": "user", "content": context}])
-        if getattr(cfg.llm, "anthropic_thinking", False):
-            kwargs["thinking"] = {"type": "adaptive"}
-            kwargs["max_tokens"] = max(max_tokens, 6000)
-        resp = client.messages.create(**kwargs)
-        return "".join(b.text for b in resp.content if b.type == "text")
-    resp = client.chat.completions.create(
-        model=model, temperature=0.2,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": context}])
-    return resp.choices[0].message.content or ""
+    try:
+        client, model = build_client(cfg.llm)
+        if cfg.llm.provider == "anthropic":
+            kwargs = dict(model=model, max_tokens=max_tokens,
+                          system=[{"type": "text", "text": system,
+                                   "cache_control": {"type": "ephemeral"}}],
+                          messages=[{"role": "user", "content": context}])
+            if getattr(cfg.llm, "anthropic_thinking", False):
+                kwargs["thinking"] = {"type": "adaptive"}
+                kwargs["max_tokens"] = max(max_tokens, 6000)
+            resp = client.messages.create(**kwargs)
+            return "".join(b.text for b in resp.content if b.type == "text")
+        resp = client.chat.completions.create(
+            model=model, temperature=0.2,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": context}])
+        return resp.choices[0].message.content or ""
+    except Exception as err:
+        raise _friendly_llm_error(err) from err
 
 
 # ── 1. CVE analysis ───────────────────────────────────────────────────────────

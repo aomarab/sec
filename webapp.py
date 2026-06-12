@@ -36,6 +36,8 @@ from config import CONFIG
 from scan import scanner as scan_scanner
 from scan.assess import run_scan
 from recon.harvester import run_recon
+from cloud import azure as azure_cloud
+from cloud import vendor as cloud_vendor
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -348,6 +350,8 @@ def _list_reports():
             kind = "actor"
         elif name.startswith("hunt-"):
             kind = "hunt"
+        elif name.startswith(("cloud-", "azure-", "aws-", "gcp-")):
+            kind = "cloud"
         else:
             kind = "briefing"
         out.append({"filename": name, "kind": kind, "owner": owners.get(name, "")})
@@ -531,6 +535,7 @@ def index():
         assets=_list_assets() if "scan" in perms else [],
         scan_sched=_load_scan_sched(), next_scan_run=_next_scan_run(),
         alert_cfg=alerts.load_config() if auth.has_perm(user, "admin") else {},
+        vendor_sections=[(k, v[0]) for k, v in cloud_vendor.SECTIONS.items()],
     )
 
 
@@ -906,6 +911,146 @@ def recon_route():
     with _LOCK:
         JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
     threading.Thread(target=_run_recon_job, args=(job_id, domain, opts, owner), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+def _run_cloud_job(job_id, creds, owner, token=None, sections=None):
+    """One Azure assessment = tenant posture (CSPM) + optional vendor (provider)
+    assessment, merged into a single report. Each part is captured independently
+    so one failing doesn't lose the other."""
+    job = JOBS[job_id]
+    handler = _ListHandler(job["logs"])
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        parts, ok = [], False
+        try:
+            result = azure_cloud.assess_azure(creds, CONFIG, progress=lambda m: log.info("%s", m), token=token)
+            parts.append(result["markdown"]); ok = True
+        except Exception as err:
+            log.info("Tenant posture failed: %s", err)
+            parts.append(f"# Azure Cloud Security Posture\n\n> Tenant posture assessment could not run: {err}")
+        if sections:
+            try:
+                log.info("Running Azure vendor security assessment…")
+                parts.append(cloud_vendor.assess_vendor("azure", CONFIG, sections=sections)); ok = True
+            except Exception as err:
+                log.info("Vendor assessment failed: %s", err)
+                parts.append(f"# Vendor Security Assessment\n\n> Vendor assessment could not run: {err}")
+        if not ok:
+            raise RuntimeError(parts[0].split("> ", 1)[-1] if parts else "Assessment failed.")
+        out = report.render("\n\n---\n\n".join(parts), prefix="azure")
+        fname = os.path.basename(out["html_path"])
+        _set_owner(fname, owner)
+        job["report"] = {"title": out["title"], "filename": fname, "emailed": False, "owner": owner}
+        job["status"] = "done"
+        log.info("Azure assessment report ready: %s", out["title"])
+    except Exception as err:
+        job["status"] = "error"
+        job["error"] = str(err)
+        log.exception("Cloud assessment failed")
+    finally:
+        root.removeHandler(handler)
+
+
+@app.route("/cloud/azure", methods=["POST"])
+@auth.require_perm("scan")
+def cloud_azure():
+    f = request.form
+    if f.get("authorized") != "on":
+        return jsonify({"error": "You must confirm you are authorized to assess this Azure tenant."}), 400
+    creds = {"tenant": (f.get("tenant") or "").strip(),
+             "client_id": (f.get("client_id") or "").strip(),
+             "secret": f.get("secret") or "",
+             "subscription": (f.get("subscription") or "").strip()}
+    if not (creds["tenant"] and creds["client_id"] and creds["secret"]):
+        return jsonify({"error": "Enter the tenant ID, client ID, and client secret."}), 400
+    owner = auth.current_user()["username"]
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    threading.Thread(target=_run_cloud_job, args=(job_id, creds, owner), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/cloud/azure/device/start", methods=["POST"])
+@auth.require_perm("scan")
+def cloud_azure_device_start():
+    f = request.form
+    if f.get("authorized") != "on":
+        return jsonify({"error": "You must confirm you are authorized to assess this Azure tenant."}), 400
+    tenant = (f.get("tenant") or "organizations").strip() or "organizations"
+    try:
+        d = azure_cloud.start_device_code(tenant)
+    except Exception as err:
+        log.exception("Device-code start failed")
+        return jsonify({"error": f"Couldn't start sign-in: {err}"}), 500
+    return jsonify({"device_code": d.get("device_code"), "user_code": d.get("user_code"),
+                    "verification_uri": d.get("verification_uri") or d.get("verification_url"),
+                    "interval": d.get("interval", 5), "expires_in": d.get("expires_in", 900),
+                    "message": d.get("message", "")})
+
+
+@app.route("/cloud/azure/device/poll", methods=["POST"])
+@auth.require_perm("scan")
+def cloud_azure_device_poll():
+    f = request.form
+    tenant = (f.get("tenant") or "organizations").strip() or "organizations"
+    device_code = f.get("device_code") or ""
+    if not device_code:
+        return jsonify({"status": "error", "error": "Missing device code."}), 400
+    res = azure_cloud.poll_token(tenant, device_code)
+    if res["status"] == "pending":
+        return jsonify({"status": "pending"})
+    if res["status"] != "ok":
+        return jsonify({"status": res["status"], "error": res.get("message", "Sign-in not completed.")})
+    creds = {"tenant": "" if tenant in ("organizations", "common") else tenant,
+             "subscription": (f.get("subscription") or "").strip()}
+    owner = auth.current_user()["username"]
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    threading.Thread(target=_run_cloud_job, args=(job_id, creds, owner),
+                     kwargs={"token": res["access_token"]}, daemon=True).start()
+    return jsonify({"status": "ok", "job_id": job_id})
+
+
+def _run_vendor_job(job_id, provider, sections, owner):
+    job = JOBS[job_id]
+    handler = _ListHandler(job["logs"])
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        log.info("Running %s vendor security assessment…", provider)
+        md = cloud_vendor.assess_vendor(provider, CONFIG, sections=sections)
+        out = report.render(md, prefix=provider)
+        fname = os.path.basename(out["html_path"])
+        _set_owner(fname, owner)
+        job["report"] = {"title": out["title"], "filename": fname, "emailed": False, "owner": owner}
+        job["status"] = "done"
+        log.info("Vendor assessment ready: %s", out["title"])
+    except Exception as err:
+        job["status"] = "error"
+        job["error"] = str(err)
+        log.exception("Vendor assessment failed")
+    finally:
+        root.removeHandler(handler)
+
+
+@app.route("/cloud/vendor-assess", methods=["POST"])
+@auth.require_perm("scan")
+def cloud_vendor_assess():
+    provider = (request.form.get("provider") or "").strip().lower()
+    if provider not in cloud_vendor.PROVIDERS:
+        return jsonify({"error": "Choose a supported provider: azure, aws, or gcp."}), 400
+    sections = request.form.getlist("sections")
+    owner = auth.current_user()["username"]
+    job_id = uuid.uuid4().hex[:12]
+    with _LOCK:
+        JOBS[job_id] = {"status": "running", "logs": [], "report": None, "error": None}
+    threading.Thread(target=_run_vendor_job, args=(job_id, provider, sections, owner), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
@@ -1288,6 +1433,12 @@ _PAGE = """<!DOCTYPE html>
   .wrap { max-width:1200px; width:100%; margin:0 auto; padding:24px; }
   .tab { display:none; }
   .tab.active { display:flex; flex-direction:column; gap:20px; }
+  .subtabs { display:flex; gap:4px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .subtabbtn { background:none; border:0; border-bottom:2px solid transparent; color:var(--muted); font-size:13.5px; font-weight:600; padding:8px 16px; margin:0; border-radius:0; cursor:pointer; }
+  .subtabbtn:hover { color:var(--text); }
+  .subtabbtn.active { color:#fff; border-bottom-color:var(--primary); }
+  .subtab { display:none; flex-direction:column; gap:20px; }
+  .subtab.active { display:flex; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 22px; box-shadow:0 1px 2px rgba(0,0,0,.25); }
   .card h2 { margin:0 0 14px; font-size:15px; color:#fff; }
   .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
@@ -1333,6 +1484,7 @@ _PAGE = """<!DOCTYPE html>
   .kind.cve { background:rgba(239,68,68,.18); color:#fca5a5; }
   .kind.actor { background:rgba(168,85,247,.20); color:#d8b4fe; }
   .kind.hunt { background:rgba(16,185,129,.18); color:#6ee7b7; }
+  .kind.cloud { background:rgba(56,189,248,.18); color:#7dd3fc; }
   .by { color:var(--muted); font-size:12px; white-space:nowrap; }
   .ms { position:relative; }
   .ms-toggle { width:100%; margin-top:0; text-align:left; background:var(--field); color:var(--text); border:1px solid var(--line); padding:9px 10px; border-radius:6px; font-size:14px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px; }
@@ -1404,6 +1556,20 @@ _PAGE = """<!DOCTYPE html>
   </div>
 </div>
 {% endmacro %}
+{% macro vendor_card(provider, label, sections) %}
+<div class="card">
+  <h2>Vendor security assessment</h2>
+  <p class="note">Provider-level review of {{ label }} — choose which checks to include below, then run. No credentials needed. The result is AI-compiled from public information; verify against the provider's trust center.</p>
+  <div class="row"><label>Checks to include</label>
+    <div class="presets">
+      {% for k, lbl in sections %}<label><input type="checkbox" name="sections" value="{{ k }}" checked> {{ lbl }}</label>{% endfor %}
+    </div>
+  </div>
+  <button class="vendor-btn" type="button" data-provider="{{ provider }}">Run vendor assessment</button>
+  <span class="pill vendor-state" style="display:none"></span>
+  <div class="vendor-console console" style="display:none"></div>
+</div>
+{% endmacro %}
 <div class="app">
 <aside class="sidebar">
   <div class="brand">{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" style="height:24px;border-radius:4px;background:#fff;padding:2px;">{% else %}<span class="dot"></span>{% endif %}Threat Intel</div>
@@ -1416,6 +1582,7 @@ _PAGE = """<!DOCTYPE html>
   {% if 'scan' in perms %}<div class="nav-group">Attack Surface</div>
   <button class="tabbtn" data-tab="tab-scan">Network Scan</button>
   <button class="tabbtn" data-tab="tab-recon">OSINT Recon</button>
+  <button class="tabbtn" data-tab="tab-cloud">Cloud Posture</button>
   <button class="tabbtn" data-tab="tab-assets">Assets</button>{% endif %}
   <div class="nav-group">Operations</div>
   {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
@@ -1492,7 +1659,7 @@ _PAGE = """<!DOCTYPE html>
     {% if reports %}
     <ul class="reports">
       {% for r in reports[:6] %}
-      <li><span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing','cve':'CVE','actor':'Actor','hunt':'Hunt'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span></li>
+      <li><span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing','cve':'CVE','actor':'Actor','hunt':'Hunt','cloud':'Cloud'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span></li>
       {% endfor %}
     </ul>
     {% else %}
@@ -1760,6 +1927,111 @@ _PAGE = """<!DOCTYPE html>
   </section>
   {% endif %}
 
+  {% if 'scan' in perms %}
+  <section class="tab" id="tab-cloud">
+  <div class="subtabs">
+    <button type="button" class="subtabbtn active" data-subtab="cloud-azure">Azure</button>
+    <button type="button" class="subtabbtn" data-subtab="cloud-aws">AWS</button>
+    <button type="button" class="subtabbtn" data-subtab="cloud-gcp">GCP</button>
+  </div>
+
+  <div class="subtab active" id="cloud-azure">
+  <div class="card">
+    <h2>Azure security posture</h2>
+    <p class="note">Read-only assessment of an Azure tenant: resource inventory (Azure Resource Graph) plus Microsoft Defender for Cloud secure score and failing security recommendations. Results are saved to History.</p>
+    <div class="warn">Use a service principal with <b>Reader</b> + <b>Security Reader</b> roles. Only assess tenants you own or are authorized to review. Credentials are used for this run only and are never stored.</div>
+    <details class="hint" style="margin:10px 0 4px">
+      <summary style="cursor:pointer;color:#60a5fa;font-size:13px">How do I create the service principal and roles? (step-by-step)</summary>
+      <ol style="margin:8px 0 0;padding-left:20px;color:var(--muted);font-size:13px;line-height:1.75">
+        <li><b>Register an app.</b> In the <a href="https://entra.microsoft.com" target="_blank">Microsoft Entra admin center</a> go to <b>Entra ID → App registrations → New registration</b>. Name it (e.g. <code>threat-intel-cspm</code>), choose <i>single tenant</i>, and Register. On the Overview page copy the <b>Directory (tenant) ID</b> and <b>Application (client) ID</b>. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app" target="_blank">Docs ↗</a></li>
+        <li><b>Create a client secret.</b> In the app, open <b>Certificates &amp; secrets → New client secret</b>, set an expiry, and copy the secret <b>Value</b> immediately (it's shown only once). <a href="https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal" target="_blank">Docs ↗</a></li>
+        <li><b>Assign read roles.</b> In the <a href="https://portal.azure.com" target="_blank">Azure portal</a> open your <b>Subscription</b> (or management group) → <b>Access control (IAM) → Add → Add role assignment</b>. Assign <b>Reader</b>, then repeat and assign <b>Security Reader</b>. On the Members tab pick <i>User, group, or service principal</i> and search for your app by name. <a href="https://learn.microsoft.com/en-us/azure/role-based-access-control/role-assignments-portal" target="_blank">Docs ↗</a> · <a href="https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles" target="_blank">Built-in roles ↗</a></li>
+        <li><b>Enable Defender for Cloud</b> on the subscription so a secure score and recommendations are available. <a href="https://learn.microsoft.com/en-us/azure/defender-for-cloud/connect-azure-subscription" target="_blank">Docs ↗</a></li>
+        <li>Paste the tenant ID, client ID, and secret below and run. Leave subscription blank to assess all that the principal can read.</li>
+      </ol>
+    </details>
+    <form id="cloud-form">
+      <div class="row"><label>Authentication</label>
+        <div class="presets">
+          <label><input type="radio" name="method" value="login" checked> Sign in with my Azure account <span class="note" style="margin:0">(no app registration)</span></label>
+          <label><input type="radio" name="method" value="sp"> Service principal (client ID + secret)</label>
+        </div>
+      </div>
+      <div class="grid3">
+        <div><label>Directory (tenant) ID <span class="note" style="margin:0">(optional for sign-in)</span></label><input name="tenant" placeholder="contoso.onmicrosoft.com or GUID"></div>
+        <div class="sp-field" style="display:none"><label>Application (client) ID</label><input name="client_id" placeholder="app registration GUID"></div>
+        <div class="sp-field" style="display:none"><label>Client secret</label><input name="secret" type="password" autocomplete="off" placeholder="service principal secret"></div>
+        <div style="grid-column:span 2"><label>Subscription (optional — name or ID; blank = all accessible)</label><input name="subscription" placeholder="leave blank to assess all subscriptions"></div>
+      </div>
+      <div class="row"><label>Vendor (provider-level) assessment to include — uncheck all to run tenant posture only</label>
+        <div class="presets">
+          {% for k, lbl in vendor_sections %}<label><input type="checkbox" name="sections" value="{{ k }}" checked> {{ lbl }}</label>{% endfor %}
+        </div>
+      </div>
+      <div class="check"><input type="checkbox" id="cloud-auth" name="authorized"><label for="cloud-auth" style="margin:0">I am authorized to assess this Azure tenant.</label></div>
+      <button id="cloud-btn" type="submit">Run Azure assessment</button>
+      <span id="cl-state" class="pill" style="display:none"></span>
+    </form>
+    <div id="cloud-device" class="warn" style="display:none"></div>
+    <div id="cl-console" class="console"></div>
+  </div>
+  <div class="card">
+    <h2>Azure assessment history</h2>
+    <ul class="reports" id="azure-reports">
+      {% for r in reports if r.filename.startswith('azure-') %}
+      <li data-file="{{ r.filename }}"><span class="name"><span class="kind cloud">Cloud</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
+        <span class="actions"><a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a><a class="dl" href="/download/{{ r.filename }}?fmt=pdf">PDF</a><a class="dl" href="/download/{{ r.filename }}?fmt=md">MD</a></span></li>
+      {% else %}
+      <li style="color:var(--muted)">No Azure assessments yet — run one above.</li>
+      {% endfor %}
+    </ul>
+  </div>
+  </div>
+
+  <div class="subtab" id="cloud-aws">
+  <div class="card">
+    <h2>AWS security posture</h2>
+    <p class="note">Read-only assessment of an AWS account: resource inventory plus AWS Security Hub findings (CIS benchmark, foundational best practices) and GuardDuty.</p>
+    <div class="warn">Planned — not yet connected. It will use a read-only IAM role/keys with the managed <b>SecurityAudit</b> policy and pull findings from AWS Security Hub. No credentials are stored.</div>
+    <p class="note">Tell the assistant "build AWS" to enable this provider. The flow mirrors Azure: enter read-only credentials (or assume-role), discover resources, pull native posture findings, and save a report here.</p>
+  </div>
+  {{ vendor_card('aws', 'Amazon Web Services (AWS)', vendor_sections) }}
+  <div class="card">
+    <h2>AWS assessment history</h2>
+    <ul class="reports" id="aws-reports">
+      {% for r in reports if r.filename.startswith('aws-') %}
+      <li data-file="{{ r.filename }}"><span class="name"><span class="kind cloud">Cloud</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
+        <span class="actions"><a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a><a class="dl" href="/download/{{ r.filename }}?fmt=pdf">PDF</a><a class="dl" href="/download/{{ r.filename }}?fmt=md">MD</a></span></li>
+      {% else %}
+      <li style="color:var(--muted)">No AWS assessments yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+  </div>
+
+  <div class="subtab" id="cloud-gcp">
+  <div class="card">
+    <h2>GCP security posture</h2>
+    <p class="note">Read-only assessment of a GCP project/organization: Cloud Asset Inventory plus Security Command Center findings.</p>
+    <div class="warn">Planned — not yet connected. It will use a read-only service-account key (viewer / securityReviewer) and pull findings from Security Command Center. No credentials are stored.</div>
+    <p class="note">Tell the assistant "build GCP" to enable this provider. The flow mirrors Azure: authenticate read-only, enumerate assets, pull native posture findings, and save a report here.</p>
+  </div>
+  {{ vendor_card('gcp', 'Google Cloud Platform (GCP)', vendor_sections) }}
+  <div class="card">
+    <h2>GCP assessment history</h2>
+    <ul class="reports" id="gcp-reports">
+      {% for r in reports if r.filename.startswith('gcp-') %}
+      <li data-file="{{ r.filename }}"><span class="name"><span class="kind cloud">Cloud</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
+        <span class="actions"><a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a><a class="dl" href="/download/{{ r.filename }}?fmt=pdf">PDF</a><a class="dl" href="/download/{{ r.filename }}?fmt=md">MD</a></span></li>
+      {% else %}
+      <li style="color:var(--muted)">No GCP assessments yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+  </div>
+  </section>
+  {% endif %}
+
   {% if 'schedule' in perms %}
   <section class="tab" id="tab-schedule">
   <div class="card">
@@ -1817,7 +2089,7 @@ _PAGE = """<!DOCTYPE html>
     <ul class="reports" id="report-list">
       {% for r in reports %}
         <li data-file="{{ r.filename }}">
-          <span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing','cve':'CVE','actor':'Actor','hunt':'Hunt'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
+          <span class="name"><span class="kind {{ r.kind }}">{{ {'analysis':'Analysis','scan':'Scan','recon':'Recon','briefing':'Briefing','cve':'CVE','actor':'Actor','hunt':'Hunt','cloud':'Cloud'}[r.kind] }}</span><a href="/reports/{{ r.filename }}" target="_blank">{{ r.filename }}</a>{% if r.owner %}<span class="by">by {{ r.owner }}</span>{% endif %}</span>
           <span class="actions">
             <button class="pv" type="button" data-file="{{ r.filename }}">Preview</button>
             <a class="dl" href="/download/{{ r.filename }}?fmt=html">HTML</a>
@@ -1985,7 +2257,16 @@ function activateTab(tabId) {
 // event delegation so any current or future .tabbtn / .dash-jump works
 document.addEventListener('click', (e) => {
   const nav = e.target.closest('.tabbtn, .dash-jump');
-  if (nav && nav.dataset.tab) { activateTab(nav.dataset.tab); }
+  if (nav && nav.dataset.tab) { e.preventDefault(); activateTab(nav.dataset.tab); }
+  // provider sub-tabs (Cloud Posture: Azure / AWS / GCP)
+  const sub = e.target.closest('.subtabbtn');
+  if (sub && sub.dataset.subtab) {
+    const scope = sub.closest('section') || document;
+    scope.querySelectorAll('.subtabbtn').forEach(x => x.classList.toggle('active', x === sub));
+    scope.querySelectorAll('.subtab').forEach(x => x.classList.remove('active'));
+    const panel = document.getElementById(sub.dataset.subtab);
+    if (panel) panel.classList.add('active');
+  }
 });
 
 // Settings: collapsible sections (accordion)
@@ -2069,7 +2350,8 @@ if (stopBtn) stopBtn.addEventListener('click', async () => {
 
 function rowHtml(f, owner) {
   const KINDS = [['analysis-','analysis','Analysis'],['scan-','scan','Scan'],['recon-','recon','Recon'],
-                 ['cve-','cve','CVE'],['actor-','actor','Actor'],['hunt-','hunt','Hunt']];
+                 ['cve-','cve','CVE'],['actor-','actor','Actor'],['hunt-','hunt','Hunt'],
+                 ['cloud-','cloud','Cloud'],['azure-','cloud','Cloud'],['aws-','cloud','Cloud'],['gcp-','cloud','Cloud']];
   const m = KINDS.find(k => f.indexOf(k[0]) === 0) || ['','briefing','Briefing'];
   const kind = m[1], label = m[2];
   const by = owner ? '<span class="by">by ' + owner + '</span>' : '';
@@ -2368,6 +2650,143 @@ document.addEventListener('click', (e) => {
     window.open('https://nvd.nist.gov/vuln/detail/' + a.dataset.cve, '_blank');
   }
 });
+
+// add a finished cloud report into the matching provider sub-tab history list
+function prependCloudReport(filename, owner) {
+  const provider = filename.indexOf('aws-') === 0 ? 'aws' : (filename.indexOf('gcp-') === 0 ? 'gcp' : 'azure');
+  const ul = document.getElementById(provider + '-reports');
+  if (!ul) return;
+  const empty = ul.querySelector('li:not([data-file])'); if (empty) empty.remove();
+  const by = owner ? '<span class="by">by ' + owner + '</span>' : '';
+  const li = document.createElement('li');
+  li.setAttribute('data-file', filename);
+  li.innerHTML = '<span class="name"><span class="kind cloud">Cloud</span>' +
+    '<a href="/reports/' + filename + '" target="_blank">' + filename + '</a>' + by + '</span>' +
+    '<span class="actions"><a class="dl" href="/download/' + filename + '?fmt=html">HTML</a>' +
+    '<a class="dl" href="/download/' + filename + '?fmt=pdf">PDF</a>' +
+    '<a class="dl" href="/download/' + filename + '?fmt=md">MD</a></span>';
+  ul.insertBefore(li, ul.firstChild);
+}
+
+// vendor security assessment (provider-level; no credentials needed)
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('.vendor-btn');
+  if (!b) return;
+  const card = b.closest('.card');
+  const st = card.querySelector('.vendor-state');
+  const con = card.querySelector('.vendor-console');
+  b.disabled = true;
+  st.style.display = 'inline'; st.textContent = 'assessing…'; st.className = 'pill vendor-state';
+  con.style.display = 'block'; con.textContent = '';
+  const fd = new FormData(); fd.append('provider', b.dataset.provider);
+  const picked = card.querySelectorAll('input[name=sections]:checked');
+  if (!picked.length) { st.textContent='pick a check'; st.className='pill vendor-state err'; con.style.display='none'; b.disabled=false; return; }
+  picked.forEach(c => fd.append('sections', c.value));
+  let r;
+  try { r = await (await fetch('/cloud/vendor-assess', { method:'POST', body: fd })).json(); }
+  catch (err) { st.textContent='error'; st.className='pill vendor-state err'; con.textContent='Error: '+err; b.disabled=false; return; }
+  if (!r.job_id) { st.textContent='error'; st.className='pill vendor-state err'; con.textContent=r.error||'failed'; b.disabled=false; return; }
+  (function poll() {
+    fetch('/status/' + r.job_id).then(x => x.json()).then(job => {
+      con.textContent = (job.logs || []).join('\\n'); con.scrollTop = con.scrollHeight;
+      if (job.status === 'running') { setTimeout(poll, 1500); return; }
+      b.disabled = false;
+      if (job.status === 'done') {
+        st.textContent = 'done'; st.className = 'pill vendor-state ok';
+        con.textContent += '\\n\\nVendor assessment ready: ' + job.report.title;
+        prependCloudReport(job.report.filename, job.report.owner);
+        addReportRow(job.report.filename, job.report.owner);
+        window.open('/reports/' + job.report.filename, '_blank');
+      } else {
+        st.textContent = 'error'; st.className = 'pill vendor-state err';
+        con.textContent += '\\n\\nError: ' + (job.error || 'unknown');
+      }
+    }).catch(() => { b.disabled = false; st.textContent='error'; st.className='pill vendor-state err'; });
+  })();
+});
+
+// cloud posture (Azure)
+const cloudForm = document.getElementById('cloud-form');
+if (cloudForm) {
+  const clBtn = document.getElementById('cloud-btn');
+  const clCon = document.getElementById('cl-console');
+  const clState = document.getElementById('cl-state');
+  const clDevice = document.getElementById('cloud-device');
+  // show/hide service-principal fields based on the chosen method
+  const syncMethod = () => {
+    const sp = cloudForm.querySelector('[name=method]:checked').value === 'sp';
+    cloudForm.querySelectorAll('.sp-field').forEach(el => el.style.display = sp ? 'block' : 'none');
+    clBtn.textContent = sp ? 'Run Azure assessment' : 'Sign in & run assessment';
+  };
+  cloudForm.querySelectorAll('[name=method]').forEach(r => r.addEventListener('change', syncMethod));
+  syncMethod();
+
+  cloudForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!document.getElementById('cloud-auth').checked) { alert('Please confirm you are authorized to assess this Azure tenant.'); return; }
+    const method = cloudForm.querySelector('[name=method]:checked').value;
+    clBtn.disabled = true; clCon.style.display = 'block'; clCon.textContent = '';
+    clDevice.style.display = 'none'; clDevice.innerHTML = '';
+    clState.style.display = 'inline'; clState.className = 'pill';
+    if (method === 'sp') {
+      clState.textContent = 'assessing…';
+      const res = await fetch('/cloud/azure', { method:'POST', body: new FormData(cloudForm) });
+      if (!res.ok) { let m='failed'; try { m=(await res.json()).error||m; } catch(e){} clState.textContent='error'; clState.className='pill err'; clCon.textContent=m; clBtn.disabled=false; return; }
+      pollCloud((await res.json()).job_id);
+    } else {
+      clState.textContent = 'starting sign-in…';
+      const res = await fetch('/cloud/azure/device/start', { method:'POST', body: new FormData(cloudForm) });
+      const d = await res.json();
+      if (!res.ok) { clState.textContent='error'; clState.className='pill err'; clCon.textContent=d.error||'sign-in failed'; clBtn.disabled=false; return; }
+      const link = '<a href="' + d.verification_uri + '" target="_blank">' + d.verification_uri + '</a>';
+      clDevice.style.display = 'block';
+      clDevice.innerHTML = 'To sign in, open ' + link + ' and enter code <b style="font-size:16px;letter-spacing:2px">' + d.user_code + '</b> — then approve. Waiting…';
+      clState.textContent = 'waiting for sign-in…';
+      pollDevice(d.device_code, (d.interval || 5) * 1000);
+    }
+  });
+
+  async function pollDevice(deviceCode, intervalMs) {
+    const fd = new FormData(cloudForm);
+    fd.set('device_code', deviceCode);
+    let d;
+    try { d = await (await fetch('/cloud/azure/device/poll', { method:'POST', body: fd })).json(); }
+    catch (err) { clState.textContent='error'; clState.className='pill err'; clCon.textContent='Error: '+err; clBtn.disabled=false; return; }
+    if (d.status === 'pending') { setTimeout(() => pollDevice(deviceCode, intervalMs), intervalMs); return; }
+    if (d.status === 'ok') {
+      clDevice.style.display = 'none';
+      clState.textContent = 'assessing…';
+      pollCloud(d.job_id);
+    } else {
+      clState.textContent = d.status === 'expired' ? 'sign-in expired' : 'error';
+      clState.className = 'pill err';
+      clCon.textContent = d.error || 'Sign-in was not completed.';
+      clBtn.disabled = false;
+    }
+  }
+
+  async function pollCloud(jobId) {
+    try {
+      const job = await (await fetch('/status/' + jobId)).json();
+      clCon.textContent = (job.logs || []).join('\\n'); clCon.scrollTop = clCon.scrollHeight;
+      if (job.status === 'running') { setTimeout(() => pollCloud(jobId), 1500); return; }
+      clBtn.disabled = false;
+      if (job.status === 'done') {
+        clState.textContent = 'done'; clState.className = 'pill ok';
+        clCon.textContent += '\\n\\nCloud posture report ready: ' + job.report.title;
+        prependCloudReport(job.report.filename, job.report.owner);
+        addReportRow(job.report.filename, job.report.owner);
+        window.open('/reports/' + job.report.filename, '_blank');
+      } else {
+        clState.textContent = 'error'; clState.className = 'pill err';
+        clCon.textContent += '\\n\\nError: ' + (job.error || 'unknown');
+      }
+    } catch (err) {
+      clBtn.disabled = false; clState.textContent = 'error'; clState.className = 'pill err';
+      clCon.textContent += '\\n\\nError: ' + err;
+    }
+  }
+}
 
 // network scan
 const scanForm = document.getElementById('scan-form');

@@ -169,11 +169,14 @@ def render(markdown: str, prefix: str = "briefing") -> dict:
     os.makedirs(REPORTS_DIR, exist_ok=True)
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y%m%d-%H%M%S")
-    title = f"Threat Intelligence Briefing {now.strftime('%Y-%m-%d')}"
+    default_title = f"Threat Intelligence Briefing {now.strftime('%Y-%m-%d')}"
 
-    # Use the first markdown H1 as the banner heading when present.
+    # Use the first markdown H1 as the title/heading when present, so each report
+    # type (scan, recon, CVE, cloud, …) gets a meaningful title; fall back to the
+    # generic briefing title only when the markdown has no H1.
     heading = next((re.sub(r"^#\s+", "", ln).strip()
-                    for ln in markdown.splitlines() if ln.startswith("# ")), title)
+                    for ln in markdown.splitlines() if ln.startswith("# ")), None)
+    title = heading or default_title
 
     md_path = os.path.join(REPORTS_DIR, f"{prefix}-{stamp}.md")
     html_path = os.path.join(REPORTS_DIR, f"{prefix}-{stamp}.html")
@@ -181,7 +184,7 @@ def render(markdown: str, prefix: str = "briefing") -> dict:
     with open(md_path, "w", encoding="utf-8") as fh:
         fh.write(markdown)
 
-    html = to_html(markdown, title=title, heading=heading)
+    html = to_html(markdown, title=title, heading=title)
     with open(html_path, "w", encoding="utf-8") as fh:
         fh.write(html)
 
