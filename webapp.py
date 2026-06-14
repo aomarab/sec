@@ -26,6 +26,7 @@ from werkzeug.utils import secure_filename
 
 import alerts
 import apikeys
+import mailconfig
 import assistant
 import audit
 import auth
@@ -67,6 +68,9 @@ def _audit(category, action, level="info", detail="", username=None):
 app = Flask(__name__)
 app.secret_key = auth.get_secret_key()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+# Overlay any UI-saved SMTP settings (email_settings.json) onto the live email
+# config so changes made in Settings → Email server take effect without a restart.
+mailconfig.apply(CONFIG.email)
 JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 
@@ -662,6 +666,7 @@ def index():
         alert_cfg=alerts.load_config() if auth.has_perm(user, "admin") else {},
         vendor_sections=[(k, v[0]) for k, v in cloud_vendor.SECTIONS.items()],
         api_keys=apikeys.status() if auth.has_perm(user, "admin") else [],
+        email_cfg=mailconfig.status() if auth.has_perm(user, "admin") else {},
         csrf_token=_csrf_token(),
     )
 
@@ -718,6 +723,26 @@ def apikeys_save():
     apikeys.save_form(request.form)
     _audit("admin", "Update API keys", level="info")
     return jsonify({"ok": True})
+
+
+@app.route("/email/save", methods=["POST"])
+@auth.require_perm("admin")
+def email_save():
+    """Persist SMTP server settings and apply them to the live config."""
+    mailconfig.save_form(request.form)
+    mailconfig.apply(CONFIG.email)
+    _audit("admin", "Update email/SMTP settings", level="info")
+    return jsonify({"ok": True, "smtp_ready": _smtp_ready()})
+
+
+@app.route("/email/test", methods=["POST"])
+@auth.require_perm("admin")
+def email_test():
+    """Test SMTP connectivity using the values in the form (falling back to the
+    stored password when the masked field is left blank). Does not send a message."""
+    cfg = mailconfig.config_from_form(request.form)
+    ok, message = delivery.test_connection(cfg)
+    return jsonify({"ok": ok, "message": message})
 
 
 @app.route("/api/health")
@@ -1971,6 +1996,10 @@ _PAGE = """<!DOCTYPE html>
   .ai-body form { display:flex; gap:8px; }
   .ai-body #ai-input { flex:1; }
   .ai-body #ai-send { margin-top:0; }
+  @media (max-width:1100px) {
+    .wrap { max-width:100%; }
+    .grid3 { grid-template-columns:1fr 1fr; }
+  }
   @media (max-width:860px) {
     .menu-toggle { display:flex; }
     .sidebar { position:fixed; top:0; left:0; height:100vh; width:248px; flex-direction:column;
@@ -1995,6 +2024,26 @@ _PAGE = """<!DOCTYPE html>
     #preview { height:420px; }
     input, select, textarea { font-size:16px; }
     .presets { gap:10px 14px; }
+    .subtabs { flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    .subtabbtn { white-space:nowrap; flex:0 0 auto; }
+  }
+  @media (max-width:560px) {
+    .topbar { flex-wrap:wrap; padding:12px 14px; }
+    .topbar h1 { flex:1 1 100%; order:2; }
+    .topbar .huser { font-size:12px; gap:8px; flex-wrap:wrap; }
+    .stats { grid-template-columns:1fr 1fr; }
+    .grid3 { grid-template-columns:1fr; }
+    .grid3 > div[style*="span 2"] { grid-column:auto; }
+    .wrap { padding:12px; }
+    .card { padding:14px 14px 16px; }
+    .card h2 { font-size:14px; }
+    .presets { flex-direction:column; gap:8px; align-items:flex-start; }
+    .ms-panel { max-height:200px; }
+    ul.reports li .actions { width:100%; }
+    .actions .dl, .actions .pv, .actions .del { flex:1 1 auto; text-align:center; }
+    #ai-fab { right:14px; bottom:14px; width:50px; height:50px; font-size:22px; }
+    #ai-widget { right:8px; left:8px; width:auto; max-width:none; bottom:72px; height:72vh; }
+    #preview { height:340px; }
   }
 </style>
 <script>
@@ -2065,7 +2114,7 @@ _PAGE = """<!DOCTYPE html>
   <button class="tabbtn" data-tab="tab-findings">Findings</button>
   <button class="tabbtn" data-tab="tab-monitor">Monitoring</button>{% endif %}
   <div class="nav-group">Operations</div>
-  {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
+  {% if 'schedule' in perms or 'scan' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
   <button class="tabbtn {{ 'active' if active_tab=='tab-history' }}" data-tab="tab-history">History</button>
   <div class="nav-group">System</div>
   <button class="tabbtn" data-tab="tab-settings">Settings</button>
@@ -2345,27 +2394,6 @@ _PAGE = """<!DOCTYPE html>
     </form>
     <div id="s-console" class="console"></div>
   </div>
-  <div class="card">
-    <h2>Scheduled scans</h2>
-    <p class="note">Recurring scan of a target; alerts fire on findings (configure in Settings). Runs only while the app is running; times are UTC.</p>
-    <form id="scan-sched-form">
-      <div class="check"><input type="checkbox" id="ss-enabled" name="enabled" {% if scan_sched.enabled %}checked{% endif %}><label for="ss-enabled" style="margin:0">Enable scheduled scan</label></div>
-      <div class="grid3" style="margin-top:12px">
-        <div><label>Target (host/IP/CIDR)</label><input name="target" value="{{ scan_sched.target or '' }}" placeholder="10.0.0.0/28"></div>
-        <div><label>Frequency</label><select name="frequency"><option value="daily" {% if scan_sched.frequency=='daily' %}selected{% endif %}>Daily</option><option value="weekly" {% if scan_sched.frequency not in ['daily','monthly'] %}selected{% endif %}>Weekly</option><option value="monthly" {% if scan_sched.frequency=='monthly' %}selected{% endif %}>Monthly (1st)</option></select></div>
-        <div><label>Time (UTC)</label><input name="time" type="time" value="{{ scan_sched.time or '03:00' }}"></div>
-        <div><label>Day of week (weekly)</label><select name="weekday">{% for d in ['mon','tue','wed','thu','fri','sat','sun'] %}<option value="{{ d }}" {% if scan_sched.weekday==d %}selected{% endif %}>{{ d|capitalize }}</option>{% endfor %}</select></div>
-        <div><label>Mode</label><select name="mode"><option value="basic" {% if scan_sched.mode=='basic' %}selected{% endif %}>Basic</option><option value="advanced" {% if scan_sched.mode!='basic' %}selected{% endif %}>Advanced</option></select></div>
-        <div><label>Ports (advanced)</label><input name="ports" value="{{ scan_sched.ports or '' }}" placeholder="1-1024"></div>
-      </div>
-      <div class="presets" style="margin-top:10px">
-        <label><input type="checkbox" name="use_nmap" {% if scan_sched.use_nmap %}checked{% endif %}> Use nmap</label>
-        <label><input type="checkbox" name="vuln_scripts" {% if scan_sched.vuln_scripts %}checked{% endif %}> nmap vuln scripts</label>
-      </div>
-      <button type="submit">Save scheduled scan</button>
-      <span id="ss-state" class="pill">{% if next_scan_run %}Next run: {{ next_scan_run }}{% else %}Not scheduled{% endif %}{% if scan_sched.last_run %} · last: {{ scan_sched.last_run }} ({{ scan_sched.last_status }}){% endif %}</span>
-    </form>
-  </div>
   </section>
   {% endif %}
 
@@ -2482,26 +2510,6 @@ _PAGE = """<!DOCTYPE html>
     <div id="rc-console" class="console"></div>
     <div id="rc-actions" style="margin-top:10px"></div>
   </div>
-  <div class="card">
-    <h2>Scheduled recon</h2>
-    <p class="note">Recurring OSINT recon of a domain for continuous attack-surface monitoring. Change detection compares each run and (if enabled in Settings → Alerts) alerts on new subdomains/exposure. Times are UTC; runs only while the app is running.</p>
-    <form id="recon-sched-form">
-      <div class="check"><input type="checkbox" id="rs-enabled" name="enabled" {% if recon_sched.enabled %}checked{% endif %}><label for="rs-enabled" style="margin:0">Enable scheduled recon</label></div>
-      <div class="grid3" style="margin-top:12px">
-        <div><label>Domain</label><input name="domain" value="{{ recon_sched.domain or '' }}" placeholder="example.com"></div>
-        <div><label>Frequency</label><select name="frequency"><option value="daily" {% if recon_sched.frequency=='daily' %}selected{% endif %}>Daily</option><option value="weekly" {% if recon_sched.frequency not in ['daily','monthly'] %}selected{% endif %}>Weekly</option><option value="monthly" {% if recon_sched.frequency=='monthly' %}selected{% endif %}>Monthly (1st)</option></select></div>
-        <div><label>Time (UTC)</label><input name="time" type="time" value="{{ recon_sched.time or '04:00' }}"></div>
-        <div><label>Day of week (weekly)</label><select name="weekday">{% for d in ['mon','tue','wed','thu','fri','sat','sun'] %}<option value="{{ d }}" {% if recon_sched.weekday==d %}selected{% endif %}>{{ d|capitalize }}</option>{% endfor %}</select></div>
-      </div>
-      <div class="presets" style="margin-top:10px">
-        <label><input type="checkbox" name="use_amass" {% if recon_sched.use_amass %}checked{% endif %}> amass (deeper subdomains)</label>
-        <label><input type="checkbox" name="use_httpx" {% if recon_sched.use_httpx %}checked{% endif %}> httpx live triage</label>
-        <label><input type="checkbox" name="use_urls" {% if recon_sched.use_urls %}checked{% endif %}> historical URLs</label>
-      </div>
-      <button type="submit">Save scheduled recon</button>
-      <span id="rs-state" class="pill">{% if next_recon_run %}Next run: {{ next_recon_run }}{% else %}Not scheduled{% endif %}{% if recon_sched.last_run %} · last: {{ recon_sched.last_run }} ({{ recon_sched.last_status }}){% endif %}</span>
-    </form>
-  </div>
   </section>
   {% endif %}
 
@@ -2610,11 +2618,12 @@ _PAGE = """<!DOCTYPE html>
   </section>
   {% endif %}
 
-  {% if 'schedule' in perms %}
+  {% if 'schedule' in perms or 'scan' in perms %}
   <section class="tab" id="tab-schedule">
+  {% if 'schedule' in perms %}
   <div class="card">
     <h2>Email schedule</h2>
-    {% if not smtp_ready %}<div class="warn">SMTP isn't configured. Set SMTP_HOST, EMAIL_FROM (and login) in your .env, or scheduled briefings are generated but not emailed.</div>{% endif %}
+    {% if not smtp_ready %}<div class="warn">SMTP isn't configured — set it under <b>Settings → Email server (SMTP)</b> so scheduled briefings can be emailed. Until then they're generated but not sent.</div>{% endif %}
     <form id="sched-form">
       <div class="check">
         <input type="checkbox" id="enabled" name="enabled" {% if schedule.enabled %}checked{% endif %}>
@@ -2657,6 +2666,50 @@ _PAGE = """<!DOCTYPE html>
     </form>
     <div class="note">Times are UTC. The schedule runs only while this app is running.</div>
   </div>
+  {% endif %}
+  {% if 'scan' in perms %}
+  <div class="card">
+    <h2>Scheduled scans</h2>
+    <p class="note">Recurring scan of a target; alerts fire on findings (configure in Settings). Runs only while the app is running; times are UTC.</p>
+    <form id="scan-sched-form">
+      <div class="check"><input type="checkbox" id="ss-enabled" name="enabled" {% if scan_sched.enabled %}checked{% endif %}><label for="ss-enabled" style="margin:0">Enable scheduled scan</label></div>
+      <div class="grid3" style="margin-top:12px">
+        <div><label>Target (host/IP/CIDR)</label><input name="target" value="{{ scan_sched.target or '' }}" placeholder="10.0.0.0/28"></div>
+        <div><label>Frequency</label><select name="frequency"><option value="daily" {% if scan_sched.frequency=='daily' %}selected{% endif %}>Daily</option><option value="weekly" {% if scan_sched.frequency not in ['daily','monthly'] %}selected{% endif %}>Weekly</option><option value="monthly" {% if scan_sched.frequency=='monthly' %}selected{% endif %}>Monthly (1st)</option></select></div>
+        <div><label>Time (UTC)</label><input name="time" type="time" value="{{ scan_sched.time or '03:00' }}"></div>
+        <div><label>Day of week (weekly)</label><select name="weekday">{% for d in ['mon','tue','wed','thu','fri','sat','sun'] %}<option value="{{ d }}" {% if scan_sched.weekday==d %}selected{% endif %}>{{ d|capitalize }}</option>{% endfor %}</select></div>
+        <div><label>Mode</label><select name="mode"><option value="basic" {% if scan_sched.mode=='basic' %}selected{% endif %}>Basic</option><option value="advanced" {% if scan_sched.mode!='basic' %}selected{% endif %}>Advanced</option></select></div>
+        <div><label>Ports (advanced)</label><input name="ports" value="{{ scan_sched.ports or '' }}" placeholder="1-1024"></div>
+      </div>
+      <div class="presets" style="margin-top:10px">
+        <label><input type="checkbox" name="use_nmap" {% if scan_sched.use_nmap %}checked{% endif %}> Use nmap</label>
+        <label><input type="checkbox" name="vuln_scripts" {% if scan_sched.vuln_scripts %}checked{% endif %}> nmap vuln scripts</label>
+      </div>
+      <button type="submit">Save scheduled scan</button>
+      <span id="ss-state" class="pill">{% if next_scan_run %}Next run: {{ next_scan_run }}{% else %}Not scheduled{% endif %}{% if scan_sched.last_run %} · last: {{ scan_sched.last_run }} ({{ scan_sched.last_status }}){% endif %}</span>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Scheduled recon</h2>
+    <p class="note">Recurring OSINT recon of a domain for continuous attack-surface monitoring. Change detection compares each run and (if enabled in Settings → Alerts) alerts on new subdomains/exposure. Times are UTC; runs only while the app is running.</p>
+    <form id="recon-sched-form">
+      <div class="check"><input type="checkbox" id="rs-enabled" name="enabled" {% if recon_sched.enabled %}checked{% endif %}><label for="rs-enabled" style="margin:0">Enable scheduled recon</label></div>
+      <div class="grid3" style="margin-top:12px">
+        <div><label>Domain</label><input name="domain" value="{{ recon_sched.domain or '' }}" placeholder="example.com"></div>
+        <div><label>Frequency</label><select name="frequency"><option value="daily" {% if recon_sched.frequency=='daily' %}selected{% endif %}>Daily</option><option value="weekly" {% if recon_sched.frequency not in ['daily','monthly'] %}selected{% endif %}>Weekly</option><option value="monthly" {% if recon_sched.frequency=='monthly' %}selected{% endif %}>Monthly (1st)</option></select></div>
+        <div><label>Time (UTC)</label><input name="time" type="time" value="{{ recon_sched.time or '04:00' }}"></div>
+        <div><label>Day of week (weekly)</label><select name="weekday">{% for d in ['mon','tue','wed','thu','fri','sat','sun'] %}<option value="{{ d }}" {% if recon_sched.weekday==d %}selected{% endif %}>{{ d|capitalize }}</option>{% endfor %}</select></div>
+      </div>
+      <div class="presets" style="margin-top:10px">
+        <label><input type="checkbox" name="use_amass" {% if recon_sched.use_amass %}checked{% endif %}> amass (deeper subdomains)</label>
+        <label><input type="checkbox" name="use_httpx" {% if recon_sched.use_httpx %}checked{% endif %}> httpx live triage</label>
+        <label><input type="checkbox" name="use_urls" {% if recon_sched.use_urls %}checked{% endif %}> historical URLs</label>
+      </div>
+      <button type="submit">Save scheduled recon</button>
+      <span id="rs-state" class="pill">{% if next_recon_run %}Next run: {{ next_recon_run }}{% else %}Not scheduled{% endif %}{% if recon_sched.last_run %} · last: {{ recon_sched.last_run }} ({{ recon_sched.last_status }}){% endif %}</span>
+    </form>
+  </div>
+  {% endif %}
   </section>
   {% endif %}
 
@@ -2718,18 +2771,38 @@ _PAGE = """<!DOCTYPE html>
     <div class="grid3" style="margin-top:14px">
       <div><label>LLM provider</label><input value="{{ provider }}" readonly></div>
       <div><label>Model</label><input value="{{ model or 'n/a' }}" readonly></div>
-      <div><label>Email configured</label><input value="{{ 'Yes' if smtp_ready else 'No' }}" readonly></div>
       <div><label>Default region</label><input value="{{ cfg.region }}" readonly></div>
       <div><label>Default industry</label><input value="{{ cfg.industry }}" readonly></div>
       <div><label>Default min severity (CVSS)</label><input value="{{ cfg.min_cvss }}" readonly></div>
       <div><label>Default look-back (days)</label><input value="{{ cfg.look_back_days }}" readonly></div>
       <div><label>Default insights</label><input value="{{ cfg.insights_to_research }}" readonly></div>
       <div><label>Max agent steps</label><input value="{{ cfg.max_steps }}" readonly></div>
-      <div><label>SMTP host</label><input value="{{ cfg.email.smtp_host or 'not set' }}" readonly></div>
-      <div><label>Email from</label><input value="{{ cfg.email.sender or 'not set' }}" readonly></div>
-      <div><label>SMTP port</label><input value="{{ cfg.email.smtp_port }}" readonly></div>
     </div>
   </div>
+  {% if is_admin %}
+  <div class="card">
+    <h2>Email server (SMTP) <span id="email-state" class="pill" style="display:none"></span></h2>
+    <p class="note">Outbound mail server used for scheduled briefings, test emails, and alert emails. Saved to <code>email_settings.json</code> and applied immediately — no restart needed. Stored values override <code>.env</code>.</p>
+    <form id="email-form">
+      <div class="grid3">
+        <div><label>SMTP host</label><input name="smtp_host" value="{{ email_cfg.smtp_host or '' }}" placeholder="smtp.office365.com"></div>
+        <div><label>SMTP port</label><input name="smtp_port" type="number" min="1" max="65535" value="{{ email_cfg.smtp_port or 587 }}" placeholder="587"></div>
+        <div><label>Email from (sender address)</label><input name="sender" value="{{ email_cfg.sender or '' }}" placeholder="briefings@company.com"></div>
+        <div><label>SMTP username <span style="color:var(--muted)">(optional)</span></label><input name="smtp_username" autocomplete="off" value="{{ email_cfg.smtp_username or '' }}" placeholder="leave blank if not required"></div>
+        <div><label>SMTP password{% if email_cfg.password_set %} · <span class="ok">set</span>{% endif %}</label>
+          <input name="smtp_password" type="password" autocomplete="new-password" placeholder="{% if email_cfg.password_set %}enter to replace{% else %}password (if required){% endif %}">
+          {% if email_cfg.password_set %}<label class="check" style="margin-top:6px;font-size:12px"><input type="checkbox" name="clear_smtp_password" style="width:auto"> Clear stored password</label>{% endif %}
+        </div>
+        <div><label>Encryption</label>
+          <label class="check" style="margin-top:9px"><input type="checkbox" name="use_tls" {% if email_cfg.use_tls %}checked{% endif %} style="width:auto"> Use STARTTLS (recommended)</label>
+        </div>
+      </div>
+      <button type="submit">Save email settings</button>
+      <button id="email-test" type="button" class="secondary" style="margin-left:8px">Test connection</button>
+    </form>
+    <div class="note">"Save" persists these settings; "Test connection" opens an SMTP session (and signs in, if a username is set) using the values above without sending a message.</div>
+  </div>
+  {% endif %}
   {% if is_admin %}
   <div class="card">
     <h2>Company logo</h2>
@@ -3900,6 +3973,23 @@ if (alForm) {
     s.textContent = 'sending...'; s.className = 'pill';
     const d = await (await fetch('/alerts/test', { method:'POST', body: new FormData(alForm) })).json();
     s.textContent = d.message; s.className = 'pill ' + (d.ok ? 'ok' : 'err');
+  });
+}
+
+// email / SMTP server settings
+const emailForm = document.getElementById('email-form');
+if (emailForm) {
+  const es = document.getElementById('email-state');
+  emailForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    es.style.display = 'inline'; es.textContent = 'saving…'; es.className = 'pill';
+    const d = await (await fetch('/email/save', { method:'POST', body: new FormData(emailForm) })).json();
+    es.textContent = d.ok ? 'Saved' : (d.message || 'error'); es.className = 'pill ' + (d.ok ? 'ok' : 'err');
+  });
+  document.getElementById('email-test').addEventListener('click', async () => {
+    es.style.display = 'inline'; es.textContent = 'testing…'; es.className = 'pill';
+    const d = await (await fetch('/email/test', { method:'POST', body: new FormData(emailForm) })).json();
+    es.textContent = d.message; es.className = 'pill ' + (d.ok ? 'ok' : 'err');
   });
 }
 
