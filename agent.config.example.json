@@ -1,0 +1,8 @@
+{
+  "server_url": "https://intel.your-company.com:5000",
+  "token": "PASTE-ENROLLMENT-TOKEN-FROM-SETTINGS-ENDPOINT-AGENTS",
+  "interval_seconds": 3600,
+  "verify_tls": true,
+  "ca_bundle": "",
+  "tags": ["production", "web-tier"]
+}

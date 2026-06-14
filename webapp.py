@@ -32,6 +32,7 @@ import audit
 import auth
 import compliance
 import findings as findings_store
+import fleet
 import monitor
 from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
@@ -84,6 +85,10 @@ def _csrf_token() -> str:
 
 @app.before_request
 def _csrf_protect():
+    # Machine-to-machine agent API authenticates with a bearer token, not a
+    # browser session, so it is exempt from the session-CSRF check.
+    if request.path.startswith("/agent/"):
+        return
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         token = session.get("_csrf")
         sent = request.headers.get("X-CSRF-Token") or request.form.get("_csrf", "")
@@ -743,6 +748,50 @@ def email_test():
     cfg = mailconfig.config_from_form(request.form)
     ok, message = delivery.test_connection(cfg)
     return jsonify({"ok": ok, "message": message})
+
+
+# ── endpoint agent fleet ─────────────────────────────────────────────────────
+@app.route("/agent/checkin", methods=["POST"])
+def agent_checkin():
+    """Ingest a host inventory from an installed endpoint agent. Authenticated
+    by a bearer enrollment token (NOT a user session); CSRF-exempt above."""
+    auth_h = request.headers.get("Authorization", "")
+    token = auth_h[7:].strip() if auth_h[:7].lower() == "bearer " else ""
+    if not fleet.verify_token(token):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if request.content_length and request.content_length > 8 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "payload too large"}), 413
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or "inventory" not in data:
+        return jsonify({"ok": False, "error": "invalid payload"}), 400
+    when = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    try:
+        summary = fleet.record_checkin(str(data.get("agent_id", "")), data,
+                                       request.remote_addr or "", when)
+    except ValueError as err:
+        return jsonify({"ok": False, "error": str(err)}), 429
+    log.info("agent check-in from %s (%s)", summary.get("hostname"), request.remote_addr)
+    return jsonify({"ok": True, "received": when})
+
+
+@app.route("/agents")
+@auth.require_perm("admin")
+def agents_list():
+    return jsonify({"endpoints": fleet.list_endpoints(), "token_hint": fleet.token_hint()})
+
+
+@app.route("/fleet/token")
+@auth.require_perm("admin")
+def fleet_token():
+    return jsonify({"token": fleet.get_token()})
+
+
+@app.route("/fleet/rotate-token", methods=["POST"])
+@auth.require_perm("admin")
+def fleet_rotate():
+    tok = fleet.rotate_token()
+    _audit("admin", "Rotate endpoint enrollment token", level="warning")
+    return jsonify({"ok": True, "token": tok})
 
 
 @app.route("/api/health")
@@ -2805,6 +2854,35 @@ _PAGE = """<!DOCTYPE html>
   {% endif %}
   {% if is_admin %}
   <div class="card">
+    <h2>Endpoint agents <span id="fleet-state" class="pill" style="display:none"></span></h2>
+    <p class="note">Optionally install a lightweight read-only agent <b>on a host</b> (Linux or Windows) to collect a deep local inventory — installed packages, running services, listening ports, local users, and patch level — beyond what a network scan can see. Hosts are covered only where an admin installs it. The agent package and installers live in <code>endpoint/</code> in the project.</p>
+    <div class="grid3" style="margin-top:6px">
+      <div style="grid-column:span 2"><label>Enrollment token <span style="color:var(--muted)">— each agent presents this to check in</span></label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="fleet-token" readonly value="••••••••••••" style="flex:1;min-width:220px">
+          <button id="fleet-reveal" type="button" class="secondary" style="margin-top:0">Reveal</button>
+          <button id="fleet-copy" type="button" class="secondary" style="margin-top:0">Copy</button>
+          <button id="fleet-rotate" type="button" class="secondary" style="margin-top:0">Rotate</button>
+        </div>
+      </div>
+      <div><label>Server URL <span style="color:var(--muted)">(for agent config)</span></label><input id="fleet-server" readonly></div>
+    </div>
+    <div class="warn" style="margin-top:10px">Rotating the token immediately invalidates every installed agent until each one's <code>agent.config.json</code> is updated with the new token. Always run the server over HTTPS so the token and inventory are encrypted in transit.</div>
+    <div class="grid3" style="margin-top:6px">
+      <div><label>Install on Linux (systemd)</label><textarea id="fleet-cmd-linux" readonly rows="2" style="font-family:Consolas,monospace;font-size:12px">sudo endpoint/packaging/linux/install.sh
+# then set server_url + token in /etc/sec-endpoint/agent.config.json</textarea></div>
+      <div><label>Install on Windows (elevated PowerShell)</label><textarea id="fleet-cmd-win" readonly rows="2" style="font-family:Consolas,monospace;font-size:12px">.\\endpoint\\packaging\\windows\\install-service.ps1   # true service (pywin32)
+.\\endpoint\\packaging\\windows\\install-task.ps1      # or no-deps Scheduled Task</textarea></div>
+      <div><label>Test from a host (no install)</label><textarea id="fleet-cmd-test" readonly rows="2" style="font-family:Consolas,monospace;font-size:12px">python -m endpoint.agent --print
+python -m endpoint.agent --config ./agent.config.json --once</textarea></div>
+    </div>
+    <h2 style="font-size:13px;margin:18px 0 8px">Enrolled endpoints <span id="fleet-count" class="pill" style="display:none"></span>
+      <button id="fleet-refresh" type="button" class="secondary" style="margin:0 0 0 8px;padding:4px 10px;font-size:12px">Refresh</button></h2>
+    <div id="fleet-list"><p class="note">Loading…</p></div>
+  </div>
+  {% endif %}
+  {% if is_admin %}
+  <div class="card">
     <h2>Company logo</h2>
     <p class="note">Appears on the login screen and in the header. PNG, JPG, GIF, SVG, or WEBP.</p>
     {% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="Current logo" style="max-height:64px;max-width:220px;display:block;margin:8px 0 12px;border:1px solid var(--line);border-radius:6px;padding:6px;background:#fff;">{% endif %}
@@ -3992,6 +4070,79 @@ if (emailForm) {
     es.textContent = d.message; es.className = 'pill ' + (d.ok ? 'ok' : 'err');
   });
 }
+
+// endpoint agent fleet
+(function () {
+  const tokenEl = document.getElementById('fleet-token');
+  if (!tokenEl) return;  // non-admins don't render this card
+  const serverEl = document.getElementById('fleet-server');
+  if (serverEl) serverEl.value = location.origin;
+  const state = document.getElementById('fleet-state');
+  let revealed = '';
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+  async function loadList() {
+    const wrap = document.getElementById('fleet-list');
+    try {
+      const d = await (await fetch('/agents')).json();
+      const rows = d.endpoints || [];
+      const cnt = document.getElementById('fleet-count');
+      cnt.style.display = 'inline';
+      cnt.textContent = rows.length + ' host' + (rows.length === 1 ? '' : 's');
+      if (!rows.length) {
+        wrap.innerHTML = '<p class="note">No endpoints have checked in yet. Install the agent on a host to see it here.</p>';
+        return;
+      }
+      let h = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:1px solid var(--line)">'
+        + '<th style="padding:6px">Host</th><th style="padding:6px">OS</th><th style="padding:6px">IP</th>'
+        + '<th style="padding:6px">Pkgs</th><th style="padding:6px">Svcs</th><th style="padding:6px">Ports</th>'
+        + '<th style="padding:6px">Last check-in</th></tr>';
+      for (const r of rows) {
+        const s = r.summary || {};
+        h += '<tr style="border-bottom:1px solid var(--line)">'
+          + '<td style="padding:6px;font-weight:600">' + esc(r.hostname || r.id)
+            + (r.tags ? ' <span class="pill">' + esc(r.tags) + '</span>' : '') + '</td>'
+          + '<td style="padding:6px">' + esc(r.os) + '</td>'
+          + '<td style="padding:6px">' + esc(r.ip) + '</td>'
+          + '<td style="padding:6px">' + esc(s.packages || 0) + '</td>'
+          + '<td style="padding:6px">' + esc(s.services || 0) + '</td>'
+          + '<td style="padding:6px">' + esc(s.listening_ports || 0) + '</td>'
+          + '<td style="padding:6px;color:var(--muted)">' + esc(r.last_checkin) + '</td></tr>';
+      }
+      wrap.innerHTML = h + '</table>';
+    } catch (e) {
+      wrap.innerHTML = '<p class="note err">Could not load endpoints.</p>';
+    }
+  }
+
+  async function reveal() {
+    if (!revealed) {
+      const d = await (await fetch('/fleet/token')).json();
+      revealed = d.token || '';
+    }
+    tokenEl.value = revealed;
+    return revealed;
+  }
+
+  document.getElementById('fleet-reveal').addEventListener('click', reveal);
+  document.getElementById('fleet-copy').addEventListener('click', async () => {
+    const t = await reveal();
+    try {
+      await navigator.clipboard.writeText(t);
+      state.style.display = 'inline'; state.textContent = 'Token copied'; state.className = 'pill ok';
+    } catch (e) { tokenEl.select(); }
+  });
+  document.getElementById('fleet-rotate').addEventListener('click', async () => {
+    if (!confirm('Rotate the enrollment token? All installed agents stop reporting until reconfigured with the new token.')) return;
+    const d = await (await fetch('/fleet/rotate-token', { method:'POST' })).json();
+    revealed = d.token || ''; tokenEl.value = revealed;
+    state.style.display = 'inline'; state.textContent = 'Token rotated'; state.className = 'pill ok';
+  });
+  document.getElementById('fleet-refresh').addEventListener('click', loadList);
+  document.addEventListener('tabshown', (e) => { if (e.detail === 'tab-settings') loadList(); });
+  loadList();
+})();
 
 // change my password
 const pwf = document.getElementById('pw-form');

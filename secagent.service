@@ -1,0 +1,22 @@
+[Unit]
+Description=Threat Intel Endpoint Agent
+Documentation=https://github.com/aomarab/sec
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sec-endpoint
+ExecStart=/usr/bin/python3 -m endpoint.agent --config /etc/sec-endpoint/agent.config.json --loop
+Restart=on-failure
+RestartSec=30
+# Light hardening for a read-only collector. Runs as root by default so it can
+# read the full inventory; add `User=secagent` for a least-privilege install
+# (some package/patch data may then be unavailable).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+
+[Install]
+WantedBy=multi-user.target
