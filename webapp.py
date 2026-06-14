@@ -1916,12 +1916,17 @@ _PAGE = """<!DOCTYPE html>
   * { box-sizing:border-box; }
   body { margin:0; font-family:'Segoe UI',-apple-system,Inter,Arial,sans-serif; background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased; }
   html.theme-light body { -webkit-font-smoothing:auto; -moz-osx-font-smoothing:auto; }
+  /* Light-theme overrides for elements that hardcode a dark background. */
+  html.theme-light .topbar { background:rgba(255,255,255,.82); }
+  html.theme-light .console { background:#F4F6F9; color:#1F2937; }
+  html.theme-light .aichat { background:#F4F6F9; }
+  html.theme-light .msg.bot { color:var(--text); }
   .topbar-live { display:flex; align-items:center; gap:7px; flex-shrink:0; }
   .live-dot { width:8px; height:8px; border-radius:50%; background:#22c55e; box-shadow:0 0 0 0 rgba(34,197,94,.6); animation:livepulse 1.8s ease-out infinite; flex-shrink:0; }
   @keyframes livepulse { 0%{ box-shadow:0 0 0 0 rgba(34,197,94,.55); } 70%{ box-shadow:0 0 0 7px rgba(34,197,94,0); } 100%{ box-shadow:0 0 0 0 rgba(34,197,94,0); } }
   .app { display:flex; min-height:100vh; }
   .sidebar { width:236px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--line); padding:16px 12px; position:sticky; top:0; height:100vh; overflow:auto; display:flex; flex-direction:column; gap:3px; }
-  .brand { display:flex; align-items:center; gap:10px; color:#fff; font-weight:700; font-size:15px; padding:6px 8px 12px; letter-spacing:.02em; }
+  .brand { display:flex; align-items:center; gap:10px; color:var(--text); font-weight:700; font-size:15px; padding:6px 8px 12px; letter-spacing:.02em; }
   .brand .dot { width:9px; height:9px; border-radius:50%; background:var(--primary); box-shadow:0 0 10px var(--primary); flex-shrink:0; }
   .nav-group { font-size:10px; text-transform:uppercase; letter-spacing:.09em; color:#64748b; margin:12px 8px 4px; display:flex; align-items:center; justify-content:space-between; cursor:pointer; user-select:none; }
   .nav-group .nav-arrow { transition:transform .15s; font-size:9px; }
@@ -1938,13 +1943,14 @@ _PAGE = """<!DOCTYPE html>
   .theme-prev .pa { width:11px; height:11px; border-radius:50%; align-self:flex-start; }
   .tabbtn { display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:none; border:0; color:var(--muted); font-size:13.5px; padding:9px 11px; border-radius:8px; cursor:pointer; margin:0; }
   .tabbtn:hover { background:rgba(148,163,184,.10); color:var(--text); }
-  .tabbtn.active { background:rgba(59,130,246,.16); color:#fff; box-shadow:inset 2px 0 0 var(--primary); }
+  .tabbtn.active { background:rgba(59,130,246,.16); color:var(--text); box-shadow:inset 2px 0 0 var(--primary); }
   .content { flex:1; min-width:0; display:flex; flex-direction:column; }
   .topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 30px; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; background:rgba(15,23,42,.85); backdrop-filter:blur(8px); }
   .topclock { font-variant-numeric:tabular-nums; font-size:12.5px; color:var(--muted); background:var(--field); border:1px solid var(--line); border-radius:999px; padding:4px 11px; white-space:nowrap; }
   .quick { display:flex; flex-wrap:wrap; gap:10px; }
   .quick .dash-jump { margin-top:0; }
-  .topbar h1 { margin:0; font-size:15px; font-weight:600; color:#fff; display:flex; align-items:center; gap:10px; min-width:0; flex:1 1 auto; overflow:hidden; }
+  .topbar h1 { margin:0; font-size:15px; font-weight:600; color:var(--text); display:flex; align-items:center; gap:10px; min-width:0; flex:1 1 auto; overflow:hidden; }
+  .topbar-mark { width:26px; height:26px; flex-shrink:0; }
   .topbar h1 .htitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .topbar .huser { flex-shrink:0; }
   .topbar-logo { height:26px; max-width:120px; border-radius:4px; background:#fff; padding:2px; flex-shrink:0; }
@@ -1964,11 +1970,11 @@ _PAGE = """<!DOCTYPE html>
   .subtabs { display:flex; gap:4px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
   .subtabbtn { background:none; border:0; border-bottom:2px solid transparent; color:var(--muted); font-size:13.5px; font-weight:600; padding:8px 16px; margin:0; border-radius:0; cursor:pointer; }
   .subtabbtn:hover { color:var(--text); }
-  .subtabbtn.active { color:#fff; border-bottom-color:var(--primary); }
+  .subtabbtn.active { color:var(--text); border-bottom-color:var(--primary); }
   .subtab { display:none; flex-direction:column; gap:20px; }
   .subtab.active { display:flex; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 22px; box-shadow:0 1px 2px rgba(0,0,0,.25); }
-  .card h2 { margin:0 0 14px; font-size:15px; color:#fff; }
+  .card h2 { margin:0 0 14px; font-size:15px; color:var(--text); }
   .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
   label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   input, select, textarea { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:6px; font-size:14px; background:var(--field); color:var(--text); font-family:inherit; }
@@ -1988,7 +1994,7 @@ _PAGE = """<!DOCTYPE html>
   .check input { width:auto; }
   .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
   .stat { background:var(--field); border:1px solid var(--line); border-radius:10px; padding:14px; }
-  .stat .n { font-size:22px; font-weight:700; color:#fff; }
+  .stat .n { font-size:22px; font-weight:700; color:var(--text); }
   .stat .l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-top:4px; }
   .risk-critical { color:#f87171; } .risk-high { color:#fb923c; } .risk-medium { color:#fbbf24; }
   .risk-low { color:#4ade80; } .risk-minimal { color:#4ade80; }
@@ -2184,7 +2190,7 @@ _PAGE = """<!DOCTYPE html>
 <div class="content">
 <header class="topbar">
   <button id="menu-toggle" class="menu-toggle" type="button" aria-label="Open menu">&#9776;</button>
-  <h1>{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" class="topbar-logo">{% endif %}Threat Intelligence Briefing Agent</h1>
+  <h1>{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" class="topbar-logo">{% else %}<svg class="topbar-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2.5 4.5 5.2v6.1c0 4.7 3.2 8.1 7.5 9.5 4.3-1.4 7.5-4.8 7.5-9.5V5.2L12 2.5Z" fill="var(--primary)" opacity=".16"/><path d="M12 2.5 4.5 5.2v6.1c0 4.7 3.2 8.1 7.5 9.5 4.3-1.4 7.5-4.8 7.5-9.5V5.2L12 2.5Z" stroke="var(--primary)" stroke-width="1.4"/><path d="m8.7 12 2.2 2.2 4.4-4.4" stroke="var(--primary)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>{% endif %}<span class="htitle">Threat Intelligence Briefing Agent</span></h1>
   <div class="topbar-live" title="Live — server clock (UTC)"><span class="live-dot"></span><span id="clock" class="topclock">live</span></div>
   <div class="huser"><span class="uname">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; </span><a href="/logout">Sign out</a></div>
 </header>
