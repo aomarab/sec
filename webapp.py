@@ -1915,6 +1915,10 @@ _PAGE = """<!DOCTYPE html>
   :root { --bg:#0F172A; --panel:#0B1220; --card:#1E293B; --line:#334155; --muted:#94A3B8; --text:#F8FAFC; --primary:#3B82F6; --primary-d:#2563EB; --field:#0F172A; }
   * { box-sizing:border-box; }
   body { margin:0; font-family:'Segoe UI',-apple-system,Inter,Arial,sans-serif; background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased; }
+  html.theme-light body { -webkit-font-smoothing:auto; -moz-osx-font-smoothing:auto; }
+  .topbar-live { display:flex; align-items:center; gap:7px; flex-shrink:0; }
+  .live-dot { width:8px; height:8px; border-radius:50%; background:#22c55e; box-shadow:0 0 0 0 rgba(34,197,94,.6); animation:livepulse 1.8s ease-out infinite; flex-shrink:0; }
+  @keyframes livepulse { 0%{ box-shadow:0 0 0 0 rgba(34,197,94,.55); } 70%{ box-shadow:0 0 0 7px rgba(34,197,94,0); } 100%{ box-shadow:0 0 0 0 rgba(34,197,94,0); } }
   .app { display:flex; min-height:100vh; }
   .sidebar { width:236px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--line); padding:16px 12px; position:sticky; top:0; height:100vh; overflow:auto; display:flex; flex-direction:column; gap:3px; }
   .brand { display:flex; align-items:center; gap:10px; color:#fff; font-weight:700; font-size:15px; padding:6px 8px 12px; letter-spacing:.02em; }
@@ -1969,7 +1973,7 @@ _PAGE = """<!DOCTYPE html>
   label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   input, select, textarea { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:6px; font-size:14px; background:var(--field); color:var(--text); font-family:inherit; }
   input::placeholder, textarea::placeholder { color:#64748b; }
-  input[readonly] { background:#0b1220; color:var(--muted); cursor:default; }
+  input[readonly], textarea[readonly] { background:rgba(128,128,128,.10); color:var(--muted); cursor:default; }
   textarea { resize:vertical; min-height:60px; }
   button { background:var(--primary); color:#fff; border:0; padding:11px 20px; border-radius:6px; font-size:14px; cursor:pointer; margin-top:12px; }
   button:hover { background:var(--primary-d); }
@@ -2102,8 +2106,12 @@ _PAGE = """<!DOCTYPE html>
     slate:   { '--bg':'#0F172A','--panel':'#0B1220','--card':'#1E293B','--line':'#334155','--muted':'#94A3B8','--text':'#F8FAFC','--field':'#0F172A' },
     midnight:{ '--bg':'#0A0F1A','--panel':'#070B14','--card':'#131C2E','--line':'#243049','--muted':'#8aa0bd','--text':'#F8FAFC','--field':'#0A0F1A' },
     graphite:{ '--bg':'#16181D','--panel':'#101216','--card':'#21242B','--line':'#363a44','--muted':'#9aa0ab','--text':'#F3F4F6','--field':'#16181D' },
-    light:   { '--bg':'#F1F5F9','--panel':'#FFFFFF','--card':'#FFFFFF','--line':'#E2E8F0','--muted':'#64748B','--text':'#0F172A','--field':'#F8FAFC' }
+    light:   { '--bg':'#F1F5F9','--panel':'#FFFFFF','--card':'#FFFFFF','--line':'#E2E8F0','--muted':'#475569','--text':'#0F172A','--field':'#FFFFFF' },
+    daylight:{ '--bg':'#FFFFFF','--panel':'#F7F9FC','--card':'#FFFFFF','--line':'#E6EAF0','--muted':'#4B5563','--text':'#111827','--field':'#FFFFFF' },
+    paper:   { '--bg':'#F4F1EA','--panel':'#FFFDF7','--card':'#FBF8F1','--line':'#E6DFCF','--muted':'#6B6253','--text':'#2A2620','--field':'#FFFDF7' },
+    arctic:  { '--bg':'#EAF0F6','--panel':'#FFFFFF','--card':'#F7FAFD','--line':'#D4DEEA','--muted':'#4A5A70','--text':'#14202E','--field':'#FFFFFF' }
   };
+  var LIGHT_THEMES = { light:1, daylight:1, paper:1, arctic:1 };
   function darken(hex, f) {
     var m = /^#?([0-9a-f]{6})$/i.exec(hex || ''); if (!m) return hex;
     var n = parseInt(m[1], 16);
@@ -2116,6 +2124,8 @@ _PAGE = """<!DOCTYPE html>
     for (var k in pal) root.setProperty(k, pal[k]);
     if (accent) { root.setProperty('--primary', accent); root.setProperty('--primary-d', darken(accent, 0.82)); }
     else { root.removeProperty('--primary'); root.removeProperty('--primary-d'); }
+    // Crisper text on light themes (forced antialiasing thins/blurs dark text on light bg).
+    document.documentElement.classList.toggle('theme-light', !!LIGHT_THEMES[theme]);
   };
   try {
     window.applyAppearance(localStorage.getItem('tiba_accent') || '', localStorage.getItem('tiba_theme') || 'slate');
@@ -2175,7 +2185,8 @@ _PAGE = """<!DOCTYPE html>
 <header class="topbar">
   <button id="menu-toggle" class="menu-toggle" type="button" aria-label="Open menu">&#9776;</button>
   <h1>{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" class="topbar-logo">{% endif %}Threat Intelligence Briefing Agent</h1>
-  <div class="huser"><span id="clock" class="topclock"></span><span class="uname">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; </span><a href="/logout">Sign out</a></div>
+  <div class="topbar-live" title="Live — server clock (UTC)"><span class="live-dot"></span><span id="clock" class="topclock">live</span></div>
+  <div class="huser"><span class="uname">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; </span><a href="/logout">Sign out</a></div>
 </header>
 <div class="wrap">
 
@@ -2809,7 +2820,10 @@ _PAGE = """<!DOCTYPE html>
         <button type="button" class="theme-tile" data-theme="slate"><span class="theme-prev" style="background:#0F172A"><span class="pc" style="background:#1E293B"></span><span class="pa" style="background:#3B82F6"></span></span>Slate</button>
         <button type="button" class="theme-tile" data-theme="midnight"><span class="theme-prev" style="background:#0A0F1A"><span class="pc" style="background:#131C2E"></span><span class="pa" style="background:#3B82F6"></span></span>Midnight</button>
         <button type="button" class="theme-tile" data-theme="graphite"><span class="theme-prev" style="background:#16181D"><span class="pc" style="background:#21242B"></span><span class="pa" style="background:#3B82F6"></span></span>Graphite</button>
-        <button type="button" class="theme-tile" data-theme="light"><span class="theme-prev" style="background:#F1F5F9"><span class="pc" style="background:#FFFFFF"></span><span class="pa" style="background:#3B82F6"></span></span>Light</button>
+        <button type="button" class="theme-tile" data-theme="light"><span class="theme-prev" style="background:#F1F5F9"><span class="pc" style="background:#FFFFFF;border:1px solid #E2E8F0"></span><span class="pa" style="background:#3B82F6"></span></span>Light</button>
+        <button type="button" class="theme-tile" data-theme="daylight"><span class="theme-prev" style="background:#FFFFFF"><span class="pc" style="background:#F7F9FC;border:1px solid #E6EAF0"></span><span class="pa" style="background:#3B82F6"></span></span>Daylight</button>
+        <button type="button" class="theme-tile" data-theme="paper"><span class="theme-prev" style="background:#F4F1EA"><span class="pc" style="background:#FBF8F1;border:1px solid #E6DFCF"></span><span class="pa" style="background:#3B82F6"></span></span>Paper</button>
+        <button type="button" class="theme-tile" data-theme="arctic"><span class="theme-prev" style="background:#EAF0F6"><span class="pc" style="background:#F7FAFD;border:1px solid #D4DEEA"></span><span class="pa" style="background:#3B82F6"></span></span>Arctic</button>
       </div>
     </div>
     <button id="appearance-reset" type="button" class="secondary">Reset to defaults</button>
