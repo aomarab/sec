@@ -1,44 +1,41 @@
-# Environment variables
+# ── Secrets & credentials (NEVER commit) ─────────────────────────────────────
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+*.key
+*.pem
+.flask_secret
+api_keys.json
+users.json
 
-# Python
+# ── Runtime state / generated data ───────────────────────────────────────────
+data/
+reports/
+uploads/
+branding/
+schedule.json
+scan_schedule.json
+scan_stats.json
+assets.json
+alerts.json
+report_owners.json
+audit_log.jsonl
+monitor_snapshots.json
+findings.json
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+.pytest_cache/
+.venv/
+venv/
+env/
+.mypy_cache/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
+# ── OS / editor ──────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# Project specific
-reports/
-*.log
+.idea/
+.vscode/
+*.swp

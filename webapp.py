@@ -1314,6 +1314,24 @@ def findings_clear():
     return jsonify({"ok": True})
 
 
+@app.route("/monitor")
+@auth.require_perm("scan")
+def monitor_view():
+    kind = request.args.get("kind", "").strip()
+    key = request.args.get("key", "").strip()
+    if kind and key:
+        return jsonify({"history": monitor.history(kind, key)})
+    return jsonify({"targets": monitor.list_targets()})
+
+
+@app.route("/monitor/clear", methods=["POST"])
+@auth.require_perm("delete")
+def monitor_clear():
+    monitor.clear()
+    _audit("scan", "Cleared monitoring history", level="warning")
+    return jsonify({"ok": True})
+
+
 @app.route("/alerts", methods=["GET"])
 @auth.require_perm("admin")
 def alerts_get():
@@ -1764,7 +1782,8 @@ _PAGE = """<!DOCTYPE html>
   <button class="tabbtn" data-tab="tab-recon">OSINT Recon</button>
   <button class="tabbtn" data-tab="tab-cloud">Cloud Posture</button>
   <button class="tabbtn" data-tab="tab-assets">Assets</button>
-  <button class="tabbtn" data-tab="tab-findings">Findings</button>{% endif %}
+  <button class="tabbtn" data-tab="tab-findings">Findings</button>
+  <button class="tabbtn" data-tab="tab-monitor">Monitoring</button>{% endif %}
   <div class="nav-group">Operations</div>
   {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
   <button class="tabbtn {{ 'active' if active_tab=='tab-history' }}" data-tab="tab-history">History</button>
@@ -2110,6 +2129,21 @@ _PAGE = """<!DOCTYPE html>
       </div>
     </div>
     <div id="findings-table" style="margin-top:14px"><p class="note">Loading…</p></div>
+  </div>
+  </section>
+  {% endif %}
+
+  {% if 'scan' in perms %}
+  <section class="tab" id="tab-monitor">
+  <div class="card">
+    <h2>Monitoring <span id="mon-meta" class="pill" style="display:none"></span></h2>
+    <p class="note">Targets you've scanned or reconned over time. Each row shows the latest run and when something last changed (new ports/subdomains or a risk shift). Re-run a target (or schedule it) to extend its timeline.</p>
+    <div style="display:flex;gap:8px;margin-bottom:6px">
+      <button id="mon-refresh" type="button" style="margin:0">Refresh</button>
+      {% if 'delete' in perms %}<button id="mon-clear" type="button" class="secondary" style="margin:0">Clear history</button>{% endif %}
+    </div>
+    <div id="mon-targets"><p class="note">Loading…</p></div>
+    <div id="mon-history" style="margin-top:14px"></div>
   </div>
   </section>
   {% endif %}
