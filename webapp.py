@@ -29,6 +29,7 @@ import apikeys
 import assistant
 import audit
 import auth
+import compliance
 import findings as findings_store
 import monitor
 from agent.loop import Cancelled, run_agent
