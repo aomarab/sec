@@ -11,6 +11,8 @@ import json
 import os
 import threading
 
+import compliance
+
 FINDINGS_FILE = os.getenv("FINDINGS_FILE", "findings.json")
 STATUSES = ["open", "triaged", "fixed", "accepted"]
 _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
@@ -60,8 +62,10 @@ def ingest(target: str, source: str, items: list[dict]) -> tuple[int, int]:
                     e["status"] = "open"
                 upd += 1
             else:
-                data[fid] = {"id": fid, "target": target, "source": source or it.get("source", ""),
+                src = source or it.get("source", "")
+                data[fid] = {"id": fid, "target": target, "source": src,
                              "severity": sev, "title": title[:240], "host": host,
+                             "owasp": compliance.map_owasp(title, src),
                              "status": "open", "owner": "", "first_seen": now,
                              "last_seen": now, "count": 1}
                 new += 1

@@ -12,6 +12,8 @@ import requests
 import apikeys
 from agent.llm import build_client
 from scan import tools
+from . import certs as cert_check
+from . import takeover as takeover_check
 from .fingerprint import fetch_tech
 from .ipintel import ip_intel
 
@@ -182,6 +184,17 @@ def run_recon(domain: str, opts: dict, cfg, progress=None) -> dict:
     # Email-security records
     spf = [t for t in dns.get("TXT", []) if t.lower().startswith("v=spf1")]
     dmarc = [t for t in doh("_dmarc." + domain, "TXT") if "v=dmarc1" in t.lower()]
+    tls_rpt = [t for t in doh("_smtp._tls." + domain, "TXT") if "v=tlsrptv1" in t.lower()]
+    bimi = [t for t in doh("default._bimi." + domain, "TXT") if "v=bimi1" in t.lower()]
+    mta_sts = ""
+    try:
+        r = requests.get(f"https://mta-sts.{domain}/.well-known/mta-sts.txt", timeout=12, headers=UA)
+        if r.status_code == 200 and "stsv1" in r.text.lower():
+            mode = next((ln.split(":", 1)[1].strip() for ln in r.text.splitlines()
+                         if ln.lower().startswith("mode")), "")
+            mta_sts = mode or "present"
+    except Exception:
+        mta_sts = ""
 
     # Web technology fingerprinting on live hosts
     tech = []
@@ -217,6 +230,18 @@ def run_recon(domain: str, opts: dict, cfg, progress=None) -> dict:
             if "?" in u or any(k in lu for k in kw):
                 interesting_urls.append(u)
         log.info("Historical URLs: %d (%d interesting)", len(hist_urls), len(interesting_urls))
+
+    # Subdomain-takeover candidates (passive fingerprints)
+    takeovers = []
+    if opts.get("takeover", True) and host_rows:
+        takeovers = takeover_check.scan_hosts([r["host"] for r in host_rows])
+        log.info("Takeover check: %d candidate(s)", len(takeovers))
+
+    # TLS certificate inspection (expiry / validity)
+    cert_rows = []
+    if opts.get("certs", True) and host_rows:
+        cert_rows = cert_check.scan_hosts([r["host"] for r in host_rows])
+        log.info("Cert check: %d host(s)", len(cert_rows))
 
     # ── context for the LLM
     ctx = (f"Domain: {domain}\nSubdomains found: {len(subs)} | resolved hosts: "
@@ -267,7 +292,25 @@ def run_recon(domain: str, opts: dict, cfg, progress=None) -> dict:
     # Email security
     parts += ["", "## Email Security", "", "| Record | Status |", "|--------|--------|",
               f"| SPF | {'`' + spf[0][:120] + '`' if spf else '**Missing** — spoofing risk'} |",
-              f"| DMARC | {'`' + dmarc[0][:120] + '`' if dmarc else '**Missing** — spoofing risk'} |"]
+              f"| DMARC | {'`' + dmarc[0][:120] + '`' if dmarc else '**Missing** — spoofing risk'} |",
+              f"| MTA-STS | {'`' + mta_sts + '`' if mta_sts else '**Missing** — SMTP downgrade risk'} |",
+              f"| TLS-RPT | {'present' if tls_rpt else '**Missing**'} |",
+              f"| BIMI | {'present' if bimi else 'Not configured'} |"]
+    # Subdomain takeover
+    if takeovers:
+        parts += ["", "## ⚠ Possible Subdomain Takeover", "",
+                  "| Host | Unclaimed service |", "|------|-------------------|"]
+        for t in takeovers:
+            parts.append(f"| `{t['host']}` | {t['service']} |")
+    # Certificates
+    if cert_rows:
+        parts += ["", "## TLS Certificates", "",
+                  "| Host | Issuer | Expires | Days left | Issues |",
+                  "|------|--------|---------|-----------|--------|"]
+        for c in cert_rows:
+            iss = ", ".join(m for _, m in c["issues"]) or "—"
+            parts.append(f"| `{c['host']}` | {c['issuer'] or '—'} | {c['not_after'] or '—'} "
+                         f"| {c['days'] if c['days'] is not None else '—'} | {iss} |")
     # Live web services (httpx)
     if web_live:
         parts += ["", "## Live Web Services (httpx)", "",
@@ -330,6 +373,21 @@ def run_recon(domain: str, opts: dict, cfg, progress=None) -> dict:
                "services": [], "risk": 0, "label": "Minimal", "last_scan": now}
               for ip in sorted(ip_set)]
 
-    return {"markdown": "\n".join(parts), "assets": assets,
+    # Normalized findings (for the findings register).
+    rfindings = []
+    for t in takeovers:
+        rfindings.append({"severity": "high", "title": t["title"], "host": t["host"], "source": "takeover"})
+    for c in cert_rows:
+        for sev, msg in c["issues"]:
+            rfindings.append({"severity": sev, "title": msg, "host": c["host"], "source": "tls-cert"})
+    if not spf:
+        rfindings.append({"severity": "medium", "title": "SPF record missing (email spoofing risk)", "host": domain, "source": "email"})
+    if not dmarc:
+        rfindings.append({"severity": "medium", "title": "DMARC record missing (email spoofing risk)", "host": domain, "source": "email"})
+    if not mta_sts:
+        rfindings.append({"severity": "low", "title": "MTA-STS not configured (SMTP downgrade risk)", "host": domain, "source": "email"})
+
+    return {"markdown": "\n".join(parts), "assets": assets, "findings": rfindings,
             "counts": {"subdomains": len(subs), "ips": len(ip_set),
-                       "emails": len(emails), "technologies": len(tech)}}
+                       "emails": len(emails), "technologies": len(tech),
+                       "takeovers": len(takeovers)}}

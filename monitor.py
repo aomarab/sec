@@ -96,6 +96,7 @@ def record(kind: str, key: str, categories: dict, metrics: dict | None = None) -
             "added": {c: len(v["added"]) for c, v in d["categories"].items() if v["added"]},
             "removed": {c: len(v["removed"]) for c, v in d["categories"].items() if v["removed"]},
             "metrics": d["metrics"],
+            "values": metrics or {},
             "totals": {c: len(set(v)) for c, v in categories.items()},
         })
         data["history"] = data["history"][-MAX_HISTORY:]

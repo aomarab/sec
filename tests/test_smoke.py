@@ -168,6 +168,36 @@ def test_apikeys_store():
     assert "ANTHROPIC_API_KEY" in statuses
 
 
+# ── compliance (OWASP) mapping ───────────────────────────────────────────────
+def test_compliance_mapping():
+    import compliance
+    assert compliance.map_owasp("SQL injection detected", "sqlmap") == "A03"
+    assert compliance.map_owasp("CVE-2024-3400 — Palo Alto", "cve") == "A06"
+    assert compliance.map_owasp("Reflects arbitrary Origin", "webchecks") == "A01"
+    assert compliance.map_owasp("RC4 ciphers offered", "testssl") == "A02"
+    summary = compliance.summarize([{"title": "XSS", "source": "wapiti"},
+                                    {"title": "Missing CSP header", "source": "headers"}])
+    codes = {s["code"] for s in summary}
+    assert "A03" in codes and "A05" in codes
+
+
+# ── subdomain takeover fingerprint ───────────────────────────────────────────
+def test_takeover_fingerprint():
+    from recon import takeover
+
+    class R:
+        def __init__(self, text):
+            self.text = text
+            self.status_code = 200
+    orig = takeover.requests.get
+    takeover.requests.get = lambda u, **k: R("<p>There isn't a GitHub Pages site here</p>")
+    try:
+        f = takeover.check_host("sub.example.com")
+        assert f and f["service"] == "GitHub Pages" and f["severity"] == "high"
+    finally:
+        takeover.requests.get = orig
+
+
 if __name__ == "__main__":
     funcs = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

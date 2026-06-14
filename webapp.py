@@ -1008,6 +1008,10 @@ def _run_recon_job(job_id, domain, opts, owner):
             result["markdown"] += "\n\n" + change["markdown"]
         except Exception:
             log.exception("Recon change detection failed")
+        try:
+            findings_store.ingest(domain, "recon", result.get("findings", []))
+        except Exception:
+            log.exception("Recon findings ingest failed")
         out = report.render(result["markdown"], prefix="recon")
         fname = os.path.basename(out["html_path"])
         _set_owner(fname, owner)
@@ -1042,7 +1046,9 @@ def recon_route():
             "use_amass": f.get("use_amass") == "on",
             "use_dnsx": f.get("use_dnsx", "on") == "on",
             "use_httpx": f.get("use_httpx") == "on",
-            "use_urls": f.get("use_urls") == "on"}
+            "use_urls": f.get("use_urls") == "on",
+            "takeover": f.get("takeover", "on") == "on",
+            "certs": f.get("certs", "on") == "on"}
     owner = auth.current_user()["username"]
     job_id = uuid.uuid4().hex[:12]
     with _LOCK:
@@ -1291,7 +1297,8 @@ def findings_list():
         target=request.args.get("target", "").strip(),
         query=request.args.get("q", "").strip())
     return jsonify({"findings": items, "stats": findings_store.stats(),
-                    "statuses": findings_store.STATUSES})
+                    "statuses": findings_store.STATUSES,
+                    "owasp": compliance.summarize(items)})
 
 
 @app.route("/findings/update", methods=["POST"])
@@ -1330,6 +1337,23 @@ def monitor_clear():
     monitor.clear()
     _audit("scan", "Cleared monitoring history", level="warning")
     return jsonify({"ok": True})
+
+
+@app.route("/api/trends")
+@auth.require_perm("scan")
+def api_trends():
+    fstats = findings_store.stats()
+    series = {}
+    try:
+        for h in monitor.list_targets():
+            pass  # ensure file exists
+        for h in monitor._load()["history"]:
+            if h.get("kind") == "scan" and "risk score" in (h.get("values") or {}):
+                series.setdefault(h["key"], []).append({"ts": h["ts"], "risk": h["values"]["risk score"]})
+    except Exception:
+        series = {}
+    series = {k: v[-20:] for k, v in series.items()}
+    return jsonify({"findings": fstats, "risk_series": series})
 
 
 @app.route("/alerts", methods=["GET"])
@@ -1849,6 +1873,14 @@ _PAGE = """<!DOCTYPE html>
   </div>
   {% endif %}
 
+  {% if 'scan' in perms %}
+  <div class="card">
+    <h2>Security trends</h2>
+    <p class="note">Findings by status and severity, plus how each monitored target's risk is trending. <a href="#" class="dash-jump" data-tab="tab-findings">Findings →</a></p>
+    <div id="dash-trends"><p class="note">Loading…</p></div>
+  </div>
+  {% endif %}
+
   <div class="card">
     <h2>Latest CVEs <span id="dash-cve-meta" class="pill" style="display:none"></span></h2>
     <p class="note">Newly published vulnerabilities from the NVD feed. <a href="#" class="dash-jump" data-tab="tab-latest-cves">See all →</a></p>
@@ -2171,6 +2203,8 @@ _PAGE = """<!DOCTYPE html>
         <div class="presets">
           <label><input type="checkbox" name="fingerprint" checked> Web technology fingerprinting</label>
           <label><input type="checkbox" name="ip_intel" checked> IP intelligence (ASN / geo / rDNS)</label>
+          <label><input type="checkbox" name="takeover" checked> Subdomain takeover check</label>
+          <label><input type="checkbox" name="certs" checked> TLS certificate check</label>
           <label><input type="checkbox" name="use_dnsx" checked> Fast resolution (dnsx){% if not tools_ok.dnsx %} (not detected){% endif %}</label>
           <label><input type="checkbox" name="use_httpx"> Live web triage (httpx){% if not tools_ok.httpx %} (not detected){% endif %}</label>
           <label><input type="checkbox" name="use_urls"> Historical URLs (gau / Wayback){% if not tools_ok.gau %} (not detected){% endif %}</label>
@@ -2950,6 +2984,47 @@ async function loadCves(targetId, limit, withAnalyze, metaId, stateId) {
   }
 }
 loadCves('dash-cves', 10, false, 'dash-cve-meta', null);   // dashboard card on page load
+
+// dashboard security trends
+async function loadTrends() {
+  const el = document.getElementById('dash-trends');
+  if (!el) return;
+  let d;
+  try { d = await (await fetch('/api/trends')).json(); }
+  catch (e) { el.innerHTML = '<p class="note">Trends unavailable.</p>'; return; }
+  const SEV = { critical:'#ef4444', high:'#fb923c', medium:'#fbbf24', low:'#4ade80', info:'#60a5fa' };
+  const f = d.findings || {by_status:{}, by_severity:{}, total:0};
+  if (!f.total) { el.innerHTML = '<p class="note">No findings yet — run a scan to populate trends.</p>'; return; }
+  let h = '<div class="stats" style="margin-bottom:12px">';
+  ['open','triaged','fixed','accepted'].forEach(s => {
+    h += '<div class="stat"><div class="n">' + (f.by_status[s]||0) + '</div><div class="l">' + s + '</div></div>';
+  });
+  h += '</div>';
+  const maxSev = Math.max(1, ...Object.values(f.by_severity||{}));
+  h += '<div style="margin-bottom:6px"><b style="font-size:13px">Open findings by severity</b></div>';
+  ['critical','high','medium','low','info'].forEach(sv => {
+    const n = (f.by_severity||{})[sv] || 0;
+    h += '<div style="display:flex;align-items:center;gap:8px;margin:3px 0">' +
+      '<span style="width:64px;font-size:12px;color:var(--muted)">' + sv + '</span>' +
+      '<div style="flex:1;background:var(--field);border-radius:4px;height:14px;overflow:hidden">' +
+      '<div style="width:' + Math.round(100*n/maxSev) + '%;height:100%;background:' + SEV[sv] + '"></div></div>' +
+      '<span style="width:28px;text-align:right;font-size:12px">' + n + '</span></div>';
+  });
+  const series = d.risk_series || {};
+  const keys = Object.keys(series);
+  if (keys.length) {
+    h += '<div style="margin:12px 0 6px"><b style="font-size:13px">Risk trend by target</b></div>';
+    keys.slice(0, 8).forEach(k => {
+      const pts = series[k]; const last = pts[pts.length-1].risk; const first = pts[0].risk;
+      const arrow = last > first ? '<span class="err">▲</span>' : (last < first ? '<span class="ok">▼</span>' : '→');
+      h += '<div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0;border-bottom:1px solid var(--line)">' +
+        '<span style="color:var(--muted)">' + k.replace(/</g,'&lt;') + '</span>' +
+        '<span>' + first + ' → <b>' + last + '</b>/100 ' + arrow + ' <span class="note" style="margin:0">(' + pts.length + ' runs)</span></span></div>';
+    });
+  }
+  el.innerHTML = h;
+}
+loadTrends();
 let cveTabLoaded = false;
 document.addEventListener('tabshown', (e) => {
   if (e.detail === 'tab-latest-cves' && !cveTabLoaded) {
@@ -3293,8 +3368,13 @@ if (findingsTable) {
     meta.textContent = (st.total||0) + ' total · ' + (st.by_status.open||0) + ' open · ' + (st.by_status.fixed||0) + ' fixed';
     const ev = d.findings || [];
     if (!ev.length) { findingsTable.innerHTML = '<p class="note">No findings yet — run a network scan, or adjust filters.</p>'; return; }
-    let h = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:2px solid var(--line)">' +
-            '<th style="padding:8px">Severity</th><th style="padding:8px">Finding</th><th style="padding:8px">Host / target</th>' +
+    let owaspBar = '';
+    if ((d.owasp || []).length) {
+      owaspBar = '<div class="note" style="margin-bottom:10px"><b>OWASP Top 10 coverage:</b> ' +
+        d.owasp.map(o => esc(o.title) + ' (' + o.count + ')').join(' · ') + '</div>';
+    }
+    let h = owaspBar + '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:2px solid var(--line)">' +
+            '<th style="padding:8px">Severity</th><th style="padding:8px">Finding</th><th style="padding:8px">OWASP</th><th style="padding:8px">Host / target</th>' +
             '<th style="padding:8px">Seen</th><th style="padding:8px">Status</th><th style="padding:8px">Owner</th></tr>';
     ev.forEach(f => {
       const sv = SEV[f.severity] || SEV.info;
@@ -3302,6 +3382,7 @@ if (findingsTable) {
       h += '<tr style="border-bottom:1px solid var(--line)" data-id="'+esc(f.id)+'">' +
         '<td style="padding:8px"><span class="badge" style="background:'+sv[0]+';color:'+sv[1]+'">' + esc(f.severity) + '</span></td>' +
         '<td style="padding:8px">' + esc(f.title) + ' <span class="note" style="margin:0">('+esc(f.source)+')</span></td>' +
+        '<td style="padding:8px;color:var(--muted);white-space:nowrap">' + esc(f.owasp||'') + '</td>' +
         '<td style="padding:8px;color:var(--muted)">' + (esc(f.host) || esc(f.target)) + '</td>' +
         '<td style="padding:8px;color:var(--muted);white-space:nowrap">×' + (f.count||1) + '<br>' + esc((f.last_seen||'').slice(0,10)) + '</td>' +
         '<td style="padding:8px"><select class="find-status" style="padding:5px">' + opts + '</select></td>' +
