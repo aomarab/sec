@@ -1845,7 +1845,13 @@ _PAGE = """<!DOCTYPE html>
   .sidebar { width:236px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--line); padding:16px 12px; position:sticky; top:0; height:100vh; overflow:auto; display:flex; flex-direction:column; gap:3px; }
   .brand { display:flex; align-items:center; gap:10px; color:#fff; font-weight:700; font-size:15px; padding:6px 8px 12px; letter-spacing:.02em; }
   .brand .dot { width:9px; height:9px; border-radius:50%; background:var(--primary); box-shadow:0 0 10px var(--primary); flex-shrink:0; }
-  .nav-group { font-size:10px; text-transform:uppercase; letter-spacing:.09em; color:#64748b; margin:12px 8px 4px; }
+  .nav-group { font-size:10px; text-transform:uppercase; letter-spacing:.09em; color:#64748b; margin:12px 8px 4px; display:flex; align-items:center; justify-content:space-between; cursor:pointer; user-select:none; }
+  .nav-group .nav-arrow { transition:transform .15s; font-size:9px; }
+  .nav-group.collapsed .nav-arrow { transform:rotate(-90deg); }
+  .nav-section.collapsed { display:none; }
+  .swatch { width:26px; height:26px; border-radius:6px; border:2px solid transparent; cursor:pointer; padding:0; }
+  .swatch.active { border-color:var(--text); }
+  .theme-opt { display:flex; align-items:center; gap:6px; }
   .tabbtn { display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:none; border:0; color:var(--muted); font-size:13.5px; padding:9px 11px; border-radius:8px; cursor:pointer; margin:0; }
   .tabbtn:hover { background:rgba(148,163,184,.10); color:var(--text); }
   .tabbtn.active { background:rgba(59,130,246,.16); color:#fff; box-shadow:inset 2px 0 0 var(--primary); }
@@ -1983,7 +1989,35 @@ _PAGE = """<!DOCTYPE html>
     input, select, textarea { font-size:16px; }
     .presets { gap:10px 14px; }
   }
-</style></head>
+</style>
+<script>
+// Apply saved appearance early (before paint) to avoid a flash.
+(function () {
+  var THEMES = {
+    slate:   { '--bg':'#0F172A','--panel':'#0B1220','--card':'#1E293B','--line':'#334155','--muted':'#94A3B8','--text':'#F8FAFC','--field':'#0F172A' },
+    midnight:{ '--bg':'#0A0F1A','--panel':'#070B14','--card':'#131C2E','--line':'#243049','--muted':'#8aa0bd','--text':'#F8FAFC','--field':'#0A0F1A' },
+    graphite:{ '--bg':'#16181D','--panel':'#101216','--card':'#21242B','--line':'#363a44','--muted':'#9aa0ab','--text':'#F3F4F6','--field':'#16181D' },
+    light:   { '--bg':'#F1F5F9','--panel':'#FFFFFF','--card':'#FFFFFF','--line':'#E2E8F0','--muted':'#64748B','--text':'#0F172A','--field':'#F8FAFC' }
+  };
+  function darken(hex, f) {
+    var m = /^#?([0-9a-f]{6})$/i.exec(hex || ''); if (!m) return hex;
+    var n = parseInt(m[1], 16);
+    var r = Math.round(((n>>16)&255)*f), g = Math.round(((n>>8)&255)*f), b = Math.round((n&255)*f);
+    return '#' + ((1<<24) + (r<<16) + (g<<8) + b).toString(16).slice(1);
+  }
+  window.applyAppearance = function (accent, theme) {
+    var root = document.documentElement.style;
+    var pal = THEMES[theme] || THEMES.slate;
+    for (var k in pal) root.setProperty(k, pal[k]);
+    if (accent) { root.setProperty('--primary', accent); root.setProperty('--primary-d', darken(accent, 0.82)); }
+    else { root.removeProperty('--primary'); root.removeProperty('--primary-d'); }
+  };
+  try {
+    window.applyAppearance(localStorage.getItem('tiba_accent') || '', localStorage.getItem('tiba_theme') || 'slate');
+  } catch (e) {}
+})();
+</script>
+</head>
 <body>
 {% macro multiselect(name, options, selected) %}
 <div class="ms" data-name="{{ name }}">
@@ -2648,6 +2682,30 @@ _PAGE = """<!DOCTYPE html>
 
   <section class="tab" id="tab-settings">
   <div class="card">
+    <h2>Appearance</h2>
+    <p class="note">Personalize the interface — saved in this browser. Choose an accent color and a theme.</p>
+    <div class="row"><label>Accent color</label>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap" id="accent-swatches">
+        <button type="button" class="swatch" data-accent="#3B82F6" style="background:#3B82F6" title="Blue"></button>
+        <button type="button" class="swatch" data-accent="#22C55E" style="background:#22C55E" title="Emerald"></button>
+        <button type="button" class="swatch" data-accent="#8B5CF6" style="background:#8B5CF6" title="Violet"></button>
+        <button type="button" class="swatch" data-accent="#F43F5E" style="background:#F43F5E" title="Rose"></button>
+        <button type="button" class="swatch" data-accent="#F59E0B" style="background:#F59E0B" title="Amber"></button>
+        <button type="button" class="swatch" data-accent="#06B6D4" style="background:#06B6D4" title="Cyan"></button>
+        <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:12px;color:var(--muted)">Custom <input type="color" id="accent-custom" value="#3B82F6" style="width:36px;height:30px;padding:2px;border:1px solid var(--line);border-radius:6px;background:var(--field)"></label>
+      </div>
+    </div>
+    <div class="row"><label>Theme</label>
+      <div class="presets" id="theme-opts">
+        <label class="theme-opt"><input type="radio" name="theme_opt" value="slate" checked> Slate (default)</label>
+        <label class="theme-opt"><input type="radio" name="theme_opt" value="midnight"> Midnight</label>
+        <label class="theme-opt"><input type="radio" name="theme_opt" value="graphite"> Graphite</label>
+        <label class="theme-opt"><input type="radio" name="theme_opt" value="light"> Light</label>
+      </div>
+    </div>
+    <button id="appearance-reset" type="button" class="secondary">Reset to defaults</button>
+  </div>
+  <div class="card">
     <h2>Configuration</h2>
     <p class="note">These come from your <code>.env</code> file and are shown for reference. Edit <code>.env</code> and restart the app to change them.</p>
     <div class="grid3" style="margin-top:14px">
@@ -2882,6 +2940,51 @@ document.querySelectorAll('#tab-settings > .card').forEach((card, i) => {
   h.insertAdjacentHTML('beforeend', '<span class="acc-arrow">&#9662;</span>');
   if (i !== 0) card.classList.add('collapsed');
   h.addEventListener('click', () => card.classList.toggle('collapsed'));
+});
+
+// Appearance (accent + theme) — persisted per browser
+(function () {
+  const swWrap = document.getElementById('accent-swatches');
+  if (!swWrap) return;
+  const custom = document.getElementById('accent-custom');
+  const themeOpts = document.querySelectorAll('input[name=theme_opt]');
+  const cur = () => ({ accent: localStorage.getItem('tiba_accent') || '', theme: localStorage.getItem('tiba_theme') || 'slate' });
+  function syncUI() {
+    const c = cur();
+    document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('active', (s.dataset.accent||'').toLowerCase() === (c.accent||'').toLowerCase()));
+    if (c.accent) custom.value = c.accent;
+    themeOpts.forEach(r => r.checked = (r.value === c.theme));
+  }
+  function apply(accent, theme) {
+    if (accent !== null) localStorage.setItem('tiba_accent', accent);
+    if (theme !== null) localStorage.setItem('tiba_theme', theme);
+    const c = cur(); window.applyAppearance(c.accent, c.theme); syncUI();
+  }
+  swWrap.querySelectorAll('.swatch').forEach(s => s.addEventListener('click', () => apply(s.dataset.accent, null)));
+  custom.addEventListener('input', () => apply(custom.value, null));
+  themeOpts.forEach(r => r.addEventListener('change', () => apply(null, r.value)));
+  document.getElementById('appearance-reset').addEventListener('click', () => {
+    localStorage.removeItem('tiba_accent'); localStorage.removeItem('tiba_theme');
+    window.applyAppearance('', 'slate'); syncUI();
+  });
+  syncUI();
+})();
+
+// Collapsible sidebar nav groups
+document.querySelectorAll('.sidebar .nav-group').forEach((g, i) => {
+  const key = 'tiba_nav_' + (g.textContent.trim().replace(/\\W+/g, '') || i);
+  const section = document.createElement('div');
+  section.className = 'nav-section';
+  let n = g.nextElementSibling;
+  while (n && !n.classList.contains('nav-group')) { const nx = n.nextElementSibling; section.appendChild(n); n = nx; }
+  g.after(section);
+  g.insertAdjacentHTML('beforeend', '<span class="nav-arrow">&#9660;</span>');
+  if (localStorage.getItem(key) === '1') { g.classList.add('collapsed'); section.classList.add('collapsed'); }
+  g.addEventListener('click', () => {
+    const collapsed = g.classList.toggle('collapsed');
+    section.classList.toggle('collapsed', collapsed);
+    try { localStorage.setItem(key, collapsed ? '1' : '0'); } catch (e) {}
+  });
 });
 
 // checkbox dropdowns (multi-select)
