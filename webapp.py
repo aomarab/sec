@@ -2876,6 +2876,24 @@ _PAGE = """<!DOCTYPE html>
       <div><label>Test from a host (no install)</label><textarea id="fleet-cmd-test" readonly rows="2" style="font-family:Consolas,monospace;font-size:12px">python -m endpoint.agent --print
 python -m endpoint.agent --config ./agent.config.json --once</textarea></div>
     </div>
+    <details style="margin-top:12px">
+      <summary style="cursor:pointer;color:#60a5fa;font-size:13px">How to install the agent on a host (4 steps)</summary>
+      <ol style="margin:10px 0 0;padding-left:20px;color:var(--muted);font-size:13px;line-height:1.85">
+        <li><b>Copy</b> the <code>endpoint/</code> folder from the project to the target host.</li>
+        <li><b>Run the installer</b> as administrator —
+          Linux: <code>sudo endpoint/packaging/linux/install.sh</code>;
+          Windows (elevated PowerShell): <code>.\\endpoint\\packaging\\windows\\install-task.ps1</code>
+          (no dependencies) or <code>install-service.ps1</code> for a true Windows service.</li>
+        <li><b>Set the config</b> — edit <code>/etc/sec-endpoint/agent.config.json</code> (Linux) or
+          <code>C:\\ProgramData\\sec-endpoint\\agent.config.json</code> (Windows): set
+          <code>server_url</code> to this server and <code>token</code> to the enrollment token above.</li>
+        <li><b>Start it</b> —
+          Linux: <code>sudo systemctl start sec-endpoint-agent</code>;
+          Windows: <code>Start-ScheduledTask -TaskName SecEndpointAgent</code>.
+          The host appears in the table below within one check-in.</li>
+      </ol>
+      <p class="note" style="margin-top:8px">Full details are in <code>endpoint/README.md</code>. Always use an <b>https</b> server URL in production so the token and inventory are encrypted in transit.</p>
+    </details>
     <h2 style="font-size:13px;margin:18px 0 8px">Enrolled endpoints <span id="fleet-count" class="pill" style="display:none"></span>
       <button id="fleet-refresh" type="button" class="secondary" style="margin:0 0 0 8px;padding:4px 10px;font-size:12px">Refresh</button></h2>
     <div id="fleet-list"><p class="note">Loading…</p></div>
