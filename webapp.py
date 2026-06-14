@@ -1851,7 +1851,13 @@ _PAGE = """<!DOCTYPE html>
   .nav-section.collapsed { display:none; }
   .swatch { width:26px; height:26px; border-radius:6px; border:2px solid transparent; cursor:pointer; padding:0; }
   .swatch.active { border-color:var(--text); }
-  .theme-opt { display:flex; align-items:center; gap:6px; }
+  .theme-tile { background:none; border:1px solid var(--line); border-radius:10px; padding:8px 8px 6px; cursor:pointer; display:flex; flex-direction:column; align-items:center; gap:6px; font-size:12px; color:var(--muted); margin:0; }
+  .theme-tile:hover { border-color:var(--muted); }
+  .theme-tile.active { border-color:var(--primary); color:var(--text); box-shadow:0 0 0 1px var(--primary); }
+  .theme-prev { width:62px; height:40px; border-radius:6px; display:flex; align-items:flex-end; gap:4px; padding:6px; border:1px solid rgba(148,163,184,.25); }
+  .theme-prev span { display:block; border-radius:3px; }
+  .theme-prev .pc { width:24px; height:15px; }
+  .theme-prev .pa { width:11px; height:11px; border-radius:50%; align-self:flex-start; }
   .tabbtn { display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:none; border:0; color:var(--muted); font-size:13.5px; padding:9px 11px; border-radius:8px; cursor:pointer; margin:0; }
   .tabbtn:hover { background:rgba(148,163,184,.10); color:var(--text); }
   .tabbtn.active { background:rgba(59,130,246,.16); color:#fff; box-shadow:inset 2px 0 0 var(--primary); }
@@ -1860,8 +1866,9 @@ _PAGE = """<!DOCTYPE html>
   .topclock { font-variant-numeric:tabular-nums; font-size:12.5px; color:var(--muted); background:var(--field); border:1px solid var(--line); border-radius:999px; padding:4px 11px; white-space:nowrap; }
   .quick { display:flex; flex-wrap:wrap; gap:10px; }
   .quick .dash-jump { margin-top:0; }
-  .topbar h1 { margin:0; font-size:15px; font-weight:600; color:#fff; display:flex; align-items:center; gap:10px; min-width:0; }
-  .topbar h1 { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .topbar h1 { margin:0; font-size:15px; font-weight:600; color:#fff; display:flex; align-items:center; gap:10px; min-width:0; flex:1 1 auto; overflow:hidden; }
+  .topbar h1 .htitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .topbar .huser { flex-shrink:0; }
   .topbar-logo { height:26px; max-width:120px; border-radius:4px; background:#fff; padding:2px; flex-shrink:0; }
   .topbar .huser { font-size:13px; color:var(--muted); display:flex; gap:12px; align-items:center; white-space:nowrap; }
   .topbar .huser a { color:var(--primary); }
@@ -2070,7 +2077,7 @@ _PAGE = """<!DOCTYPE html>
 <header class="topbar">
   <button id="menu-toggle" class="menu-toggle" type="button" aria-label="Open menu">&#9776;</button>
   <h1>{% if logo %}<img src="/branding/logo?v={{ logo_ver }}" alt="" class="topbar-logo">{% endif %}Threat Intelligence Briefing Agent</h1>
-  <div class="huser"><span id="clock" class="topclock"></span>{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; <a href="/logout">Sign out</a></div>
+  <div class="huser"><span id="clock" class="topclock"></span><span class="uname">{{ user.username }}{% if is_admin %} (admin){% endif %} &middot; </span><a href="/logout">Sign out</a></div>
 </header>
 <div class="wrap">
 
@@ -2696,11 +2703,11 @@ _PAGE = """<!DOCTYPE html>
       </div>
     </div>
     <div class="row"><label>Theme</label>
-      <div class="presets" id="theme-opts">
-        <label class="theme-opt"><input type="radio" name="theme_opt" value="slate" checked> Slate (default)</label>
-        <label class="theme-opt"><input type="radio" name="theme_opt" value="midnight"> Midnight</label>
-        <label class="theme-opt"><input type="radio" name="theme_opt" value="graphite"> Graphite</label>
-        <label class="theme-opt"><input type="radio" name="theme_opt" value="light"> Light</label>
+      <div id="theme-opts" style="display:flex;gap:12px;flex-wrap:wrap">
+        <button type="button" class="theme-tile" data-theme="slate"><span class="theme-prev" style="background:#0F172A"><span class="pc" style="background:#1E293B"></span><span class="pa" style="background:#3B82F6"></span></span>Slate</button>
+        <button type="button" class="theme-tile" data-theme="midnight"><span class="theme-prev" style="background:#0A0F1A"><span class="pc" style="background:#131C2E"></span><span class="pa" style="background:#3B82F6"></span></span>Midnight</button>
+        <button type="button" class="theme-tile" data-theme="graphite"><span class="theme-prev" style="background:#16181D"><span class="pc" style="background:#21242B"></span><span class="pa" style="background:#3B82F6"></span></span>Graphite</button>
+        <button type="button" class="theme-tile" data-theme="light"><span class="theme-prev" style="background:#F1F5F9"><span class="pc" style="background:#FFFFFF"></span><span class="pa" style="background:#3B82F6"></span></span>Light</button>
       </div>
     </div>
     <button id="appearance-reset" type="button" class="secondary">Reset to defaults</button>
@@ -2947,13 +2954,13 @@ document.querySelectorAll('#tab-settings > .card').forEach((card, i) => {
   const swWrap = document.getElementById('accent-swatches');
   if (!swWrap) return;
   const custom = document.getElementById('accent-custom');
-  const themeOpts = document.querySelectorAll('input[name=theme_opt]');
+  const tiles = document.querySelectorAll('.theme-tile');
   const cur = () => ({ accent: localStorage.getItem('tiba_accent') || '', theme: localStorage.getItem('tiba_theme') || 'slate' });
   function syncUI() {
     const c = cur();
     document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('active', (s.dataset.accent||'').toLowerCase() === (c.accent||'').toLowerCase()));
     if (c.accent) custom.value = c.accent;
-    themeOpts.forEach(r => r.checked = (r.value === c.theme));
+    tiles.forEach(t => t.classList.toggle('active', t.dataset.theme === c.theme));
   }
   function apply(accent, theme) {
     if (accent !== null) localStorage.setItem('tiba_accent', accent);
@@ -2962,7 +2969,7 @@ document.querySelectorAll('#tab-settings > .card').forEach((card, i) => {
   }
   swWrap.querySelectorAll('.swatch').forEach(s => s.addEventListener('click', () => apply(s.dataset.accent, null)));
   custom.addEventListener('input', () => apply(custom.value, null));
-  themeOpts.forEach(r => r.addEventListener('change', () => apply(null, r.value)));
+  tiles.forEach(t => t.addEventListener('click', () => apply(null, t.dataset.theme)));
   document.getElementById('appearance-reset').addEventListener('click', () => {
     localStorage.removeItem('tiba_accent'); localStorage.removeItem('tiba_theme');
     window.applyAppearance('', 'slate'); syncUI();
