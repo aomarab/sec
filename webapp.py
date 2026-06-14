@@ -2568,11 +2568,14 @@ function activateTab(tabId, remember) {
   if (remember !== false) { try { localStorage.setItem('tiba_tab', tabId); } catch (e) {} }
   closeNav();
   window.scrollTo({ top: 0 });
+  // notify lazy-loaded tabs (works for clicks AND programmatic restore)
+  document.dispatchEvent(new CustomEvent('tabshown', { detail: tabId }));
 }
-// restore the last-viewed tab across reloads
+// restore the last-viewed tab across reloads (deferred so lazy-load listeners
+// are attached before the tabshown event fires)
 try {
   const saved = localStorage.getItem('tiba_tab');
-  if (saved && document.getElementById(saved)) activateTab(saved, false);
+  if (saved && document.getElementById(saved)) setTimeout(() => activateTab(saved, false), 0);
 } catch (e) {}
 // event delegation so any current or future .tabbtn / .dash-jump works
 document.addEventListener('click', (e) => {
@@ -2948,8 +2951,8 @@ async function loadCves(targetId, limit, withAnalyze, metaId, stateId) {
 }
 loadCves('dash-cves', 10, false, 'dash-cve-meta', null);   // dashboard card on page load
 let cveTabLoaded = false;
-document.addEventListener('click', (e) => {
-  if (e.target.closest('[data-tab="tab-latest-cves"]') && !cveTabLoaded) {
+document.addEventListener('tabshown', (e) => {
+  if (e.detail === 'tab-latest-cves' && !cveTabLoaded) {
     cveTabLoaded = true;
     loadCves('cve-feed', 50, true, 'cve-feed-meta', 'cve-feed-state');
   }
@@ -3315,7 +3318,7 @@ if (findingsTable) {
   }
   findingsTable.addEventListener('change', (e) => { if (e.target.classList.contains('find-status')) saveFinding(e.target.closest('tr')); });
   findingsTable.addEventListener('blur', (e) => { if (e.target.classList.contains('find-owner')) saveFinding(e.target.closest('tr')); }, true);
-  document.addEventListener('click', (e) => { if (e.target.closest('[data-tab="tab-findings"]')) loadFindings(); });
+  document.addEventListener('tabshown', (e) => { if (e.detail === 'tab-findings') loadFindings(); });
   document.getElementById('find-refresh').addEventListener('click', loadFindings);
   [fs, fsev].forEach(el => el.addEventListener('change', loadFindings));
   let tmr; [ft, fq].forEach(el => el.addEventListener('input', () => { clearTimeout(tmr); tmr = setTimeout(loadFindings, 400); }));
@@ -3324,6 +3327,68 @@ if (findingsTable) {
     if (!confirm('Clear the entire findings register?')) return;
     await fetch('/findings/clear', { method:'POST' });
     loadFindings();
+  });
+}
+
+// ── Monitoring (tracked targets + change timeline) ──
+const monTargets = document.getElementById('mon-targets');
+if (monTargets) {
+  const monHistory = document.getElementById('mon-history');
+  const monMeta = document.getElementById('mon-meta');
+  const esc = (s) => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  function fmtMap(m) { return Object.entries(m||{}).map(([k,v]) => esc(k)+': '+v).join(', ') || '—'; }
+  async function loadTargets() {
+    monTargets.innerHTML = '<p class="note">Loading…</p>'; monHistory.innerHTML = '';
+    let d;
+    try { d = await (await fetch('/monitor')).json(); }
+    catch (e) { monTargets.innerHTML = '<p class="err">Couldn\\'t load monitoring data.</p>'; return; }
+    const t = d.targets || [];
+    monMeta.style.display='inline'; monMeta.textContent = t.length + ' tracked target(s)';
+    if (!t.length) { monTargets.innerHTML = '<p class="note">No tracked targets yet — run a network scan or OSINT recon, then run it again to build a change timeline.</p>'; return; }
+    let h = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:2px solid var(--line)">' +
+            '<th style="padding:8px">Type</th><th style="padding:8px">Target</th><th style="padding:8px">Last run</th>' +
+            '<th style="padding:8px">Metrics</th><th style="padding:8px">Items</th><th style="padding:8px">Runs</th><th style="padding:8px">Last change</th></tr>';
+    t.forEach(r => {
+      h += '<tr style="border-bottom:1px solid var(--line);cursor:pointer" class="mon-row" data-kind="'+esc(r.kind)+'" data-key="'+esc(r.key)+'">' +
+        '<td style="padding:8px"><span class="kind '+(r.kind==='recon'?'recon':'scan')+'">'+esc(r.kind)+'</span></td>' +
+        '<td style="padding:8px">'+esc(r.key)+'</td>' +
+        '<td style="padding:8px;color:var(--muted);white-space:nowrap">'+esc(r.ts)+'</td>' +
+        '<td style="padding:8px;color:var(--muted)">'+fmtMap(r.metrics)+'</td>' +
+        '<td style="padding:8px;color:var(--muted)">'+fmtMap(r.totals)+'</td>' +
+        '<td style="padding:8px">'+r.runs+'</td>' +
+        '<td style="padding:8px;color:var(--muted);white-space:nowrap">'+(esc(r.last_change)||'—')+'</td></tr>';
+    });
+    monTargets.innerHTML = h + '</table><p class="note" style="margin-top:6px">Click a target to see its change timeline.</p>';
+  }
+  async function loadHistory(kind, key) {
+    monHistory.innerHTML = '<p class="note">Loading timeline…</p>';
+    const d = await (await fetch('/monitor?kind=' + encodeURIComponent(kind) + '&key=' + encodeURIComponent(key))).json();
+    const rows = d.history || [];
+    let h = '<div class="card"><h2 style="font-size:14px">Timeline — ' + esc(key) + '</h2>';
+    if (!rows.length) { monHistory.innerHTML = h + '<p class="note">No history.</p></div>'; return; }
+    h += '<ul class="reports">';
+    rows.forEach(r => {
+      let parts = [];
+      Object.entries(r.metrics||{}).forEach(([k,v]) => parts.push('<span>'+esc(k)+' '+v.from+'→'+v.to+'</span>'));
+      Object.entries(r.added||{}).forEach(([k,v]) => parts.push('<span class="ok">+'+v+' '+esc(k)+'</span>'));
+      Object.entries(r.removed||{}).forEach(([k,v]) => parts.push('<span class="err">-'+v+' '+esc(k)+'</span>'));
+      const summary = r.baseline ? '<span class="note" style="margin:0">baseline captured</span>'
+                     : (parts.length ? parts.join(' · ') : '<span class="note" style="margin:0">no changes</span>');
+      h += '<li><span class="name" style="color:var(--muted);white-space:nowrap">'+esc(r.ts)+'</span><span>'+summary+'</span></li>';
+    });
+    monHistory.innerHTML = h + '</ul></div>';
+  }
+  monTargets.addEventListener('click', (e) => {
+    const row = e.target.closest('.mon-row');
+    if (row) loadHistory(row.dataset.kind, row.dataset.key);
+  });
+  document.addEventListener('tabshown', (e) => { if (e.detail === 'tab-monitor') loadTargets(); });
+  document.getElementById('mon-refresh').addEventListener('click', loadTargets);
+  const mc = document.getElementById('mon-clear');
+  if (mc) mc.addEventListener('click', async () => {
+    if (!confirm('Clear all monitoring history and snapshots?')) return;
+    await fetch('/monitor/clear', { method:'POST' });
+    loadTargets();
   });
 }
 
@@ -3473,7 +3538,7 @@ if (userTable) {
       });
       logsTable.innerHTML = h + '</table>';
     }
-    document.addEventListener('click', (e) => { if (e.target.closest('[data-tab="tab-logs"]')) loadLogs(); });
+    document.addEventListener('tabshown', (e) => { if (e.detail === 'tab-logs') loadLogs(); });
     document.getElementById('logs-refresh').addEventListener('click', loadLogs);
     [fcat, flvl].forEach(el => el.addEventListener('change', loadLogs));
     let t; [fuser, fq].forEach(el => el.addEventListener('input', () => { clearTimeout(t); t = setTimeout(loadLogs, 400); }));
