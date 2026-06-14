@@ -430,5 +430,20 @@ def run_scan(opts: dict, cfg=CONFIG, progress=None) -> str:
               f"- Engines: {', '.join(engines)}",
               "- Detection/recon only — no exploitation, brute-force, or password attacks.",
               "- CVEs are *potential* matches from service banners via NVD — verify before acting."]
+    # Normalized findings for the findings register (dedup + lifecycle tracking).
+    norm = []
+    for f in sec_findings:
+        norm.append({"severity": f["severity"], "title": f["title"], "host": f["host"], "source": "check"})
+    for r in cve_rows:
+        norm.append({"severity": (r.get("severity") or "medium").lower(),
+                     "title": f"{r['cve']} — {r['product']}", "host": target, "source": "cve"})
+    for f in nuclei_findings:
+        norm.append({"severity": f["severity"], "title": f["name"], "host": f["host"], "source": "nuclei"})
+    for f in web_findings:
+        norm.append({"severity": f["severity"], "title": f.get("name") or f.get("check", ""),
+                     "host": f.get("host", ""), "source": f.get("source", "web")})
+    for f in testssl_findings:
+        norm.append({"severity": f["severity"], "title": f["id"], "host": f["host"], "source": "testssl"})
+
     return {"markdown": "\n".join(parts), "stats": stats,
-            "assets": _build_assets(results, sec_findings)}
+            "assets": _build_assets(results, sec_findings), "findings": norm}

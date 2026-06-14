@@ -7,11 +7,13 @@ from __future__ import annotations
 import copy
 import datetime as _dt
 import glob
+import hmac
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -27,6 +29,8 @@ import apikeys
 import assistant
 import audit
 import auth
+import findings as findings_store
+import monitor
 from agent.loop import Cancelled, run_agent
 from analysis.analyze import analyze_document
 from analysis.extract import SUPPORTED as ALLOWED_EXT
@@ -64,6 +68,30 @@ app.secret_key = auth.get_secret_key()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
+
+
+# ── CSRF protection ──────────────────────────────────────────────────────────
+def _csrf_token() -> str:
+    if "_csrf" not in session:
+        session["_csrf"] = secrets.token_urlsafe(32)
+    return session["_csrf"]
+
+
+@app.before_request
+def _csrf_protect():
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        token = session.get("_csrf")
+        sent = request.headers.get("X-CSRF-Token") or request.form.get("_csrf", "")
+        if not token or not sent or not hmac.compare_digest(str(token), str(sent)):
+            return jsonify({"error": "Session expired or invalid request token. Reload the page."}), 400
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return resp
 
 SCHEDULE_FILE = os.getenv("SCHEDULE_FILE", "schedule.json")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "uploads")
@@ -312,9 +340,22 @@ def _next_scan_run():
 
 
 def _do_scan(opts, owner):
-    """Run a scan, persist report + stats + assets, and fire alerts. Shared by
-    the on-demand job and the scheduler."""
+    """Run a scan, persist report + stats + assets, track change detection +
+    findings, and fire alerts. Shared by the on-demand job and the scheduler."""
     result = run_scan(opts, CONFIG)
+    # Change detection vs the previous run of this target.
+    try:
+        ports = [f"{a['ip']}:{p}" for a in result.get("assets", []) for p in a.get("ports", [])]
+        change = monitor.record("scan", opts["target"], {"open ports": ports},
+                                 {"risk score": result["stats"]["risk"]})
+        result["markdown"] += "\n\n" + change["markdown"]
+    except Exception:
+        log.exception("Change detection failed")
+    # Findings register (dedup + status tracking).
+    try:
+        findings_store.ingest(opts["target"], "scan", result.get("findings", []))
+    except Exception:
+        log.exception("Findings ingest failed")
     out = report.render(result["markdown"], prefix="scan")
     fname = os.path.basename(out["html_path"])
     _set_owner(fname, owner)
@@ -482,10 +523,11 @@ def login():
             return redirect(request.form.get("next") or "/")
         audit.record("auth", "Failed sign-in attempt", user=uname, level="warning")
         return render_template_string(_LOGIN, error="Invalid username or password.",
-                                      next=nxt, logo=logo, logo_ver=ver)
+                                      next=nxt, logo=logo, logo_ver=ver, csrf_token=_csrf_token())
     if auth.current_user():
         return redirect("/")
-    return render_template_string(_LOGIN, error=None, next=nxt, logo=logo, logo_ver=ver)
+    return render_template_string(_LOGIN, error=None, next=nxt, logo=logo, logo_ver=ver,
+                                  csrf_token=_csrf_token())
 
 
 @app.route("/logout")
@@ -558,6 +600,7 @@ def index():
         alert_cfg=alerts.load_config() if auth.has_perm(user, "admin") else {},
         vendor_sections=[(k, v[0]) for k, v in cloud_vendor.SECTIONS.items()],
         api_keys=apikeys.status() if auth.has_perm(user, "admin") else [],
+        csrf_token=_csrf_token(),
     )
 
 
@@ -956,10 +999,18 @@ def _run_recon_job(job_id, domain, opts, owner):
         def progress(done, total):
             log.info("Resolved %d / %d hosts", done, total)
         result = run_recon(domain, opts, CONFIG, progress)
+        assets = result.get("assets", [])
+        try:
+            hosts = sorted({a["hostname"] for a in assets if a.get("hostname")})
+            ips = sorted({a["ip"] for a in assets if a.get("ip")})
+            change = monitor.record("recon", domain,
+                                    {"subdomains": hosts, "resolved IPs": ips})
+            result["markdown"] += "\n\n" + change["markdown"]
+        except Exception:
+            log.exception("Recon change detection failed")
         out = report.render(result["markdown"], prefix="recon")
         fname = os.path.basename(out["html_path"])
         _set_owner(fname, owner)
-        assets = result.get("assets", [])
         _upsert_assets(assets)
         targets = sorted({a["ip"] for a in assets if a.get("ip")})[:64]
         job["report"] = {"title": out["title"], "filename": fname,
@@ -1231,6 +1282,38 @@ def assets_clear():
     return jsonify({"ok": True})
 
 
+@app.route("/findings")
+@auth.require_perm("scan")
+def findings_list():
+    items = findings_store.list_findings(
+        status=request.args.get("status", "").strip(),
+        severity=request.args.get("severity", "").strip(),
+        target=request.args.get("target", "").strip(),
+        query=request.args.get("q", "").strip())
+    return jsonify({"findings": items, "stats": findings_store.stats(),
+                    "statuses": findings_store.STATUSES})
+
+
+@app.route("/findings/update", methods=["POST"])
+@auth.require_perm("scan")
+def findings_update():
+    fid = request.form.get("id", "").strip()
+    ok = findings_store.update(fid, status=request.form.get("status"),
+                               owner=request.form.get("owner"))
+    if ok:
+        _audit("scan", "Update finding",
+               detail=f"{fid}: status={request.form.get('status','')} owner={request.form.get('owner','')}")
+    return jsonify({"ok": ok})
+
+
+@app.route("/findings/clear", methods=["POST"])
+@auth.require_perm("delete")
+def findings_clear():
+    findings_store.clear()
+    _audit("scan", "Cleared findings register", level="warning")
+    return jsonify({"ok": True})
+
+
 @app.route("/alerts", methods=["GET"])
 @auth.require_perm("admin")
 def alerts_get():
@@ -1484,6 +1567,7 @@ _LOGIN = """<!DOCTYPE html>
     <p class="sub">Sign in to continue</p>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
     <input type="hidden" name="next" value="{{ next }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <label>Username</label><input name="username" autofocus autocomplete="username">
     <label>Password</label><input name="password" type="password" autocomplete="current-password">
     <button type="submit">Sign in</button>
@@ -1494,6 +1578,7 @@ _LOGIN = """<!DOCTYPE html>
 _PAGE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{ csrf_token }}">
 <title>Threat Intelligence Briefing Agent</title>
 <style>
   :root { --bg:#0F172A; --panel:#0B1220; --card:#1E293B; --line:#334155; --muted:#94A3B8; --text:#F8FAFC; --primary:#3B82F6; --primary-d:#2563EB; --field:#0F172A; }
@@ -1678,7 +1763,8 @@ _PAGE = """<!DOCTYPE html>
   <button class="tabbtn" data-tab="tab-scan">Network Scan</button>
   <button class="tabbtn" data-tab="tab-recon">OSINT Recon</button>
   <button class="tabbtn" data-tab="tab-cloud">Cloud Posture</button>
-  <button class="tabbtn" data-tab="tab-assets">Assets</button>{% endif %}
+  <button class="tabbtn" data-tab="tab-assets">Assets</button>
+  <button class="tabbtn" data-tab="tab-findings">Findings</button>{% endif %}
   <div class="nav-group">Operations</div>
   {% if 'schedule' in perms %}<button class="tabbtn" data-tab="tab-schedule">Schedule</button>{% endif %}
   <button class="tabbtn {{ 'active' if active_tab=='tab-history' }}" data-tab="tab-history">History</button>
@@ -2004,6 +2090,26 @@ _PAGE = """<!DOCTYPE html>
     {% else %}
     <p style="color:#6b7280">No assets yet — run a network scan.</p>
     {% endif %}
+  </div>
+  </section>
+  {% endif %}
+
+  {% if 'scan' in perms %}
+  <section class="tab" id="tab-findings">
+  <div class="card">
+    <h2>Findings register <span id="find-meta" class="pill" style="display:none"></span></h2>
+    <p class="note">Security findings from scans, de-duplicated across runs and tracked through their lifecycle. Update status and assign an owner to drive remediation. Re-appearing fixed findings auto-reopen.</p>
+    <div class="grid3">
+      <div><label>Status</label><select id="findf-status"><option value="">All statuses</option></select></div>
+      <div><label>Severity</label><select id="findf-severity"><option value="">All severities</option><option>critical</option><option>high</option><option>medium</option><option>low</option><option>info</option></select></div>
+      <div><label>Target / host</label><input id="findf-target" placeholder="filter by target"></div>
+      <div style="grid-column:span 2"><label>Search</label><input id="findf-q" placeholder="search title / host / source"></div>
+      <div style="display:flex;align-items:flex-end;gap:8px">
+        <button id="find-refresh" type="button" style="margin:0">Refresh</button>
+        {% if 'delete' in perms %}<button id="find-clear" type="button" class="secondary" style="margin:0">Clear all</button>{% endif %}
+      </div>
+    </div>
+    <div id="findings-table" style="margin-top:14px"><p class="note">Loading…</p></div>
   </div>
   </section>
   {% endif %}
@@ -2383,7 +2489,19 @@ _PAGE = """<!DOCTYPE html>
 <script>
 window.__ALL_PRIVS = [{% for k,lbl in all_privileges %}["{{ k }}","{{ lbl }}"]{% if not loop.last %},{% endif %}{% endfor %}];
 const _fetch = window.fetch;
-window.fetch = async (...a) => { const r = await _fetch(...a); if (r.status === 401) { location.href = '/login'; } return r; };
+const _CSRF = (document.querySelector('meta[name=csrf-token]') || {}).content || '';
+window.fetch = async (input, init) => {
+  init = init || {};
+  const method = (init.method || (input && typeof input !== 'string' && input.method) || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD' && _CSRF) {
+    const h = new Headers(init.headers || {});
+    h.set('X-CSRF-Token', _CSRF);
+    init.headers = h;
+  }
+  const r = await _fetch(input, init);
+  if (r.status === 401) { location.href = '/login'; }
+  return r;
+};
 </script>
 <script>
 // mobile slide-out menu
@@ -3114,6 +3232,66 @@ if (assetsClear) assetsClear.addEventListener('click', async () => {
   await fetch('/assets/clear', { method:'POST' });
   location.reload();
 });
+
+// ── Findings register ──
+const findingsTable = document.getElementById('findings-table');
+if (findingsTable) {
+  const SEV = { critical:['#7f1d1d','#fca5a5'], high:['#7c2d12','#fdba74'], medium:['#78350f','#fcd34d'],
+                low:['#14432a','#86efac'], info:['#1e3a5f','#93c5fd'] };
+  const esc = (s) => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const fs = document.getElementById('findf-status'), fsev = document.getElementById('findf-severity');
+  const ft = document.getElementById('findf-target'), fq = document.getElementById('findf-q');
+  const meta = document.getElementById('find-meta');
+  let statuses = [], filled = false;
+  async function loadFindings() {
+    findingsTable.innerHTML = '<p class="note">Loading…</p>';
+    const qs = new URLSearchParams({ status:fs.value, severity:fsev.value, target:ft.value, q:fq.value });
+    let d;
+    try { d = await (await fetch('/findings?' + qs)).json(); }
+    catch (e) { findingsTable.innerHTML = '<p class="err">Couldn\\'t load findings.</p>'; return; }
+    statuses = d.statuses || [];
+    if (!filled) { statuses.forEach(s => fs.insertAdjacentHTML('beforeend', '<option value="'+s+'">'+s+'</option>')); filled = true; }
+    const st = d.stats || {by_status:{}};
+    meta.style.display='inline';
+    meta.textContent = (st.total||0) + ' total · ' + (st.by_status.open||0) + ' open · ' + (st.by_status.fixed||0) + ' fixed';
+    const ev = d.findings || [];
+    if (!ev.length) { findingsTable.innerHTML = '<p class="note">No findings yet — run a network scan, or adjust filters.</p>'; return; }
+    let h = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left;border-bottom:2px solid var(--line)">' +
+            '<th style="padding:8px">Severity</th><th style="padding:8px">Finding</th><th style="padding:8px">Host / target</th>' +
+            '<th style="padding:8px">Seen</th><th style="padding:8px">Status</th><th style="padding:8px">Owner</th></tr>';
+    ev.forEach(f => {
+      const sv = SEV[f.severity] || SEV.info;
+      const opts = statuses.map(s => '<option value="'+s+'"' + (s===f.status?' selected':'') + '>'+s+'</option>').join('');
+      h += '<tr style="border-bottom:1px solid var(--line)" data-id="'+esc(f.id)+'">' +
+        '<td style="padding:8px"><span class="badge" style="background:'+sv[0]+';color:'+sv[1]+'">' + esc(f.severity) + '</span></td>' +
+        '<td style="padding:8px">' + esc(f.title) + ' <span class="note" style="margin:0">('+esc(f.source)+')</span></td>' +
+        '<td style="padding:8px;color:var(--muted)">' + (esc(f.host) || esc(f.target)) + '</td>' +
+        '<td style="padding:8px;color:var(--muted);white-space:nowrap">×' + (f.count||1) + '<br>' + esc((f.last_seen||'').slice(0,10)) + '</td>' +
+        '<td style="padding:8px"><select class="find-status" style="padding:5px">' + opts + '</select></td>' +
+        '<td style="padding:8px"><input class="find-owner" value="'+esc(f.owner||'')+'" placeholder="assign" style="padding:5px;width:110px"></td></tr>';
+    });
+    findingsTable.innerHTML = h + '</table>';
+  }
+  async function saveFinding(tr) {
+    const fd = new FormData();
+    fd.append('id', tr.dataset.id);
+    fd.append('status', tr.querySelector('.find-status').value);
+    fd.append('owner', tr.querySelector('.find-owner').value);
+    await fetch('/findings/update', { method:'POST', body: fd });
+  }
+  findingsTable.addEventListener('change', (e) => { if (e.target.classList.contains('find-status')) saveFinding(e.target.closest('tr')); });
+  findingsTable.addEventListener('blur', (e) => { if (e.target.classList.contains('find-owner')) saveFinding(e.target.closest('tr')); }, true);
+  document.addEventListener('click', (e) => { if (e.target.closest('[data-tab="tab-findings"]')) loadFindings(); });
+  document.getElementById('find-refresh').addEventListener('click', loadFindings);
+  [fs, fsev].forEach(el => el.addEventListener('change', loadFindings));
+  let tmr; [ft, fq].forEach(el => el.addEventListener('input', () => { clearTimeout(tmr); tmr = setTimeout(loadFindings, 400); }));
+  const fc = document.getElementById('find-clear');
+  if (fc) fc.addEventListener('click', async () => {
+    if (!confirm('Clear the entire findings register?')) return;
+    await fetch('/findings/clear', { method:'POST' });
+    loadFindings();
+  });
+}
 
 // API keys
 const keysForm = document.getElementById('keys-form');

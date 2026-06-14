@@ -120,6 +120,8 @@ ENV DATA_DIR=/app/data \
     OWNERS_FILE=/app/data/report_owners.json \
     API_KEYS_FILE=/app/data/api_keys.json \
     AUDIT_LOG_FILE=/app/data/audit_log.jsonl \
+    MONITOR_FILE=/app/data/monitor_snapshots.json \
+    FINDINGS_FILE=/app/data/findings.json \
     WEB_PORT=5000
 
 RUN mkdir -p /app/data/reports /app/data/uploads /app/data/branding
