@@ -99,6 +99,28 @@ def dispatch(stats: dict, target: str, filename: str) -> dict:
     return {"sent": sent, "errors": errors}
 
 
+def dispatch_changes(target: str, change: dict) -> dict:
+    """Alert when a monitored target gains NEW exposure (from change detection)."""
+    cfg = load_config()
+    if not cfg.get("enabled") or not cfg.get("alert_on_change", True):
+        return {"skipped": "disabled"}
+    d = change.get("diff", {}) if change else {}
+    added = {c: v["added"] for c, v in d.get("categories", {}).items() if v.get("added")}
+    risk_up = any(isinstance(mv.get("to"), (int, float)) and mv["to"] > mv.get("from", 0)
+                  for mv in d.get("metrics", {}).values())
+    if not added and not risk_up:
+        return {"skipped": "no new exposure"}
+    lines = [f"Change alert — {target}", "New exposure detected:"]
+    for cat, items in added.items():
+        lines.append(f"- +{len(items)} {cat}: " + ", ".join(items[:10]) + (" …" if len(items) > 10 else ""))
+    for name, mv in d.get("metrics", {}).items():
+        lines.append(f"- {name}: {mv['from']} → {mv['to']}")
+    text = "\n".join(lines)
+    sent, errors = _send_all(cfg, text, {"target": target, "type": "change", "added": added})
+    log.info("Change alert for %s via %s", target, sent or "no channels")
+    return {"sent": sent, "errors": errors}
+
+
 def send_test(cfg: dict) -> dict:
     text = ("Test alert from your Threat Intelligence Briefing Agent. "
             "If you received this, the channel is configured correctly.")

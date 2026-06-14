@@ -198,6 +198,38 @@ def test_takeover_fingerprint():
         takeover.requests.get = orig
 
 
+# ── change-based alerts ──────────────────────────────────────────────────────
+def test_change_alert_gating():
+    import alerts
+    orig = alerts.load_config
+    alerts.load_config = lambda: {"enabled": True, "alert_on_change": True}
+    try:
+        # no additions, no risk increase -> skipped
+        empty = alerts.dispatch_changes("t", {"diff": {"categories": {}, "metrics": {}}})
+        assert empty.get("skipped")
+        # new ports -> fires (no channels configured, so sent is empty but not skipped)
+        fired = alerts.dispatch_changes("t", {"diff": {"categories": {"open ports": {"added": ["h:80"], "removed": []}}, "metrics": {}}})
+        assert "skipped" not in fired and "sent" in fired
+    finally:
+        alerts.load_config = orig
+
+
+# ── findings SLA / aging ─────────────────────────────────────────────────────
+def test_findings_aging_mttr():
+    import findings as F
+    import datetime
+    F.FINDINGS_FILE = tempfile.mktemp(suffix=".json")
+    F.ingest("t", "scan", [{"severity": "high", "title": "Old issue", "host": "h"}])
+    fid = F.list_findings()[0]["id"]
+    raw = json.load(open(F.FINDINGS_FILE))
+    raw[fid]["first_seen"] = (datetime.datetime.utcnow() - datetime.timedelta(days=45)).strftime("%Y-%m-%d %H:%M UTC")
+    json.dump(raw, open(F.FINDINGS_FILE, "w"))
+    s = F.stats()
+    assert s["aging"]["30-90d"] == 1 and s["open_overdue"] == 1
+    F.update(fid, status="fixed")
+    assert F.stats()["mttr_days"] is not None
+
+
 if __name__ == "__main__":
     funcs = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

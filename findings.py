@@ -16,7 +16,20 @@ import compliance
 FINDINGS_FILE = os.getenv("FINDINGS_FILE", "findings.json")
 STATUSES = ["open", "triaged", "fixed", "accepted"]
 _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
+_TS_FMT = "%Y-%m-%d %H:%M UTC"
 _LOCK = threading.Lock()
+
+
+def _parse(ts: str):
+    try:
+        return datetime.datetime.strptime(ts, _TS_FMT)
+    except (ValueError, TypeError):
+        return None
+
+
+def _age_days(ts: str) -> int | None:
+    dt = _parse(ts)
+    return (datetime.datetime.utcnow() - dt).days if dt else None
 
 
 def _load() -> dict:
@@ -60,6 +73,7 @@ def ingest(target: str, source: str, items: list[dict]) -> tuple[int, int]:
                 e["count"] = e.get("count", 1) + 1
                 if e.get("status") == "fixed":   # reappeared after being marked fixed
                     e["status"] = "open"
+                    e.pop("fixed_at", None)
                 upd += 1
             else:
                 src = source or it.get("source", "")
@@ -99,6 +113,10 @@ def update(fid: str, status: str | None = None, owner: str | None = None) -> boo
         if not e:
             return False
         if status in STATUSES:
+            if status == "fixed" and e.get("status") != "fixed":
+                e["fixed_at"] = datetime.datetime.utcnow().strftime(_TS_FMT)
+            elif status != "fixed":
+                e.pop("fixed_at", None)
             e["status"] = status
         if owner is not None:
             e["owner"] = owner[:80]
@@ -107,13 +125,26 @@ def update(fid: str, status: str | None = None, owner: str | None = None) -> boo
 
 
 def stats() -> dict:
-    data = _load().values()
+    data = list(_load().values())
     by_status = {s: 0 for s in STATUSES}
     by_sev = {}
+    aging = {"<7d": 0, "7-30d": 0, "30-90d": 0, ">90d": 0}
+    mttr_samples = []
     for e in data:
         by_status[e.get("status", "open")] = by_status.get(e.get("status", "open"), 0) + 1
         by_sev[e.get("severity", "info")] = by_sev.get(e.get("severity", "info"), 0) + 1
-    return {"total": sum(by_status.values()), "by_status": by_status, "by_severity": by_sev}
+        if e.get("status") in ("open", "triaged"):
+            age = _age_days(e.get("first_seen", ""))
+            if age is not None:
+                bucket = "<7d" if age < 7 else "7-30d" if age < 30 else "30-90d" if age < 90 else ">90d"
+                aging[bucket] += 1
+        if e.get("status") == "fixed" and e.get("fixed_at"):
+            opened, closed = _parse(e.get("first_seen", "")), _parse(e["fixed_at"])
+            if opened and closed:
+                mttr_samples.append((closed - opened).days)
+    mttr = round(sum(mttr_samples) / len(mttr_samples), 1) if mttr_samples else None
+    return {"total": sum(by_status.values()), "by_status": by_status, "by_severity": by_sev,
+            "aging": aging, "mttr_days": mttr, "open_overdue": aging["30-90d"] + aging[">90d"]}
 
 
 def clear() -> None:

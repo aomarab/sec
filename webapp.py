@@ -340,6 +340,62 @@ def _next_scan_run():
     return job.next_run_time.strftime("%Y-%m-%d %H:%M UTC") if job and job.next_run_time else None
 
 
+# ── scheduled recon ──────────────────────────────────────────────────────────
+RECON_SCHED_FILE = os.getenv("RECON_SCHED_FILE", "recon_schedule.json")
+_RECON_JOB_ID = "osint_recon"
+
+
+def _load_recon_sched():
+    try:
+        with open(RECON_SCHED_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_recon_sched(data):
+    with open(RECON_SCHED_FILE, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+
+
+def _register_recon_sched(sched):
+    if _SCHED.get_job(_RECON_JOB_ID):
+        _SCHED.remove_job(_RECON_JOB_ID)
+    if not sched.get("enabled"):
+        return
+    hour, minute = (sched.get("time") or "04:00").split(":")
+    kwargs = {"hour": int(hour), "minute": int(minute)}
+    if sched.get("frequency") == "weekly":
+        kwargs["day_of_week"] = sched.get("weekday", "mon")
+    elif sched.get("frequency") == "monthly":
+        kwargs["day"] = "1"
+    _SCHED.add_job(_scheduled_recon_run, CronTrigger(timezone="UTC", **kwargs), id=_RECON_JOB_ID)
+    log.info("OSINT recon schedule registered: %s", kwargs)
+
+
+def _next_recon_run():
+    job = _SCHED.get_job(_RECON_JOB_ID)
+    return job.next_run_time.strftime("%Y-%m-%d %H:%M UTC") if job and job.next_run_time else None
+
+
+def _scheduled_recon_run():
+    sched = _load_recon_sched()
+    if not sched or not sched.get("enabled") or not sched.get("domain"):
+        return
+    log.info("Running scheduled recon of %s", sched["domain"])
+    opts = {"fingerprint": True, "ip_intel": True, "use_subfinder": True, "use_dnsx": True,
+            "takeover": True, "certs": True, "use_amass": bool(sched.get("use_amass")),
+            "use_httpx": bool(sched.get("use_httpx")), "use_urls": bool(sched.get("use_urls"))}
+    try:
+        _do_recon(sched["domain"], opts, "scheduler")
+        sched["last_run"] = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        sched["last_status"] = "ok"
+    except Exception:
+        sched["last_status"] = "error"
+        log.exception("Scheduled recon failed")
+    _save_recon_sched(sched)
+
+
 def _do_scan(opts, owner):
     """Run a scan, persist report + stats + assets, track change detection +
     findings, and fire alerts. Shared by the on-demand job and the scheduler."""
@@ -350,6 +406,10 @@ def _do_scan(opts, owner):
         change = monitor.record("scan", opts["target"], {"open ports": ports},
                                  {"risk score": result["stats"]["risk"]})
         result["markdown"] += "\n\n" + change["markdown"]
+        try:
+            alerts.dispatch_changes(opts["target"], change)
+        except Exception:
+            log.exception("Change alert failed")
     except Exception:
         log.exception("Change detection failed")
     # Findings register (dedup + status tracking).
@@ -598,6 +658,7 @@ def index():
         scan_stats=_latest_scan_stats(),
         assets=_list_assets() if "scan" in perms else [],
         scan_sched=_load_scan_sched(), next_scan_run=_next_scan_run(),
+        recon_sched=_load_recon_sched(), next_recon_run=_next_recon_run(),
         alert_cfg=alerts.load_config() if auth.has_perm(user, "admin") else {},
         vendor_sections=[(k, v[0]) for k, v in cloud_vendor.SECTIONS.items()],
         api_keys=apikeys.status() if auth.has_perm(user, "admin") else [],
@@ -657,6 +718,35 @@ def apikeys_save():
     apikeys.save_form(request.form)
     _audit("admin", "Update API keys", level="info")
     return jsonify({"ok": True})
+
+
+@app.route("/api/health")
+@auth.require_perm("admin")
+def api_health():
+    tools_ok = scan_tools.available()
+    tools_ok["nmap"] = scan_scanner.nmap_available()
+    jobs = []
+    for job in _SCHED.get_jobs():
+        jobs.append({"id": job.id,
+                     "next_run": job.next_run_time.strftime("%Y-%m-%d %H:%M UTC")
+                     if job.next_run_time else None})
+    files = {}
+    for label, path in [("reports", report.REPORTS_DIR),
+                        ("audit log", os.getenv("AUDIT_LOG_FILE", "audit_log.jsonl")),
+                        ("findings", os.getenv("FINDINGS_FILE", "findings.json")),
+                        ("monitoring", os.getenv("MONITOR_FILE", "monitor_snapshots.json")),
+                        ("assets", ASSETS_FILE), ("users", os.getenv("USERS_FILE", "users.json"))]:
+        try:
+            if os.path.isdir(path):
+                files[label] = sum(os.path.getsize(os.path.join(path, f))
+                                   for f in os.listdir(path) if os.path.isfile(os.path.join(path, f)))
+            else:
+                files[label] = os.path.getsize(path)
+        except OSError:
+            files[label] = 0
+    return jsonify({"tools": tools_ok,
+                    "keys": [{"label": k["label"], "configured": k["configured"]} for k in apikeys.status()],
+                    "jobs": jobs, "data_bytes": files, "provider": CONFIG.llm.provider})
 
 
 @app.route("/admin/logs")
@@ -990,6 +1080,32 @@ def scan_route():
     return jsonify({"job_id": job_id})
 
 
+def _do_recon(domain, opts, owner, progress=None):
+    """Run recon + change detection + alerts + findings ingest, persist report.
+    Shared by the on-demand job and the scheduler. Returns (out, result, assets)."""
+    result = run_recon(domain, opts, CONFIG, progress)
+    assets = result.get("assets", [])
+    try:
+        hosts = sorted({a["hostname"] for a in assets if a.get("hostname")})
+        ips = sorted({a["ip"] for a in assets if a.get("ip")})
+        change = monitor.record("recon", domain, {"subdomains": hosts, "resolved IPs": ips})
+        result["markdown"] += "\n\n" + change["markdown"]
+        try:
+            alerts.dispatch_changes(domain, change)
+        except Exception:
+            log.exception("Recon change alert failed")
+    except Exception:
+        log.exception("Recon change detection failed")
+    try:
+        findings_store.ingest(domain, "recon", result.get("findings", []))
+    except Exception:
+        log.exception("Recon findings ingest failed")
+    out = report.render(result["markdown"], prefix="recon")
+    _set_owner(os.path.basename(out["html_path"]), owner)
+    _upsert_assets(assets)
+    return out, result, assets
+
+
 def _run_recon_job(job_id, domain, opts, owner):
     job = JOBS[job_id]
     handler = _ListHandler(job["logs"])
@@ -999,26 +1115,9 @@ def _run_recon_job(job_id, domain, opts, owner):
     try:
         def progress(done, total):
             log.info("Resolved %d / %d hosts", done, total)
-        result = run_recon(domain, opts, CONFIG, progress)
-        assets = result.get("assets", [])
-        try:
-            hosts = sorted({a["hostname"] for a in assets if a.get("hostname")})
-            ips = sorted({a["ip"] for a in assets if a.get("ip")})
-            change = monitor.record("recon", domain,
-                                    {"subdomains": hosts, "resolved IPs": ips})
-            result["markdown"] += "\n\n" + change["markdown"]
-        except Exception:
-            log.exception("Recon change detection failed")
-        try:
-            findings_store.ingest(domain, "recon", result.get("findings", []))
-        except Exception:
-            log.exception("Recon findings ingest failed")
-        out = report.render(result["markdown"], prefix="recon")
-        fname = os.path.basename(out["html_path"])
-        _set_owner(fname, owner)
-        _upsert_assets(assets)
+        out, result, assets = _do_recon(domain, opts, "scheduler" if owner is None else owner, progress)
         targets = sorted({a["ip"] for a in assets if a.get("ip")})[:64]
-        job["report"] = {"title": out["title"], "filename": fname,
+        job["report"] = {"title": out["title"], "filename": os.path.basename(out["html_path"]),
                          "emailed": False, "owner": owner,
                          "targets": ", ".join(targets), "target_count": len(targets)}
         job["status"] = "done"
@@ -1232,7 +1331,32 @@ def save_scan_schedule():
     }
     _save_scan_sched(sched)
     _register_scan_sched(sched)
+    _audit("schedule", "Save scheduled scan", detail=f"target={target}; enabled={sched['enabled']}")
     return jsonify({"ok": True, "enabled": sched["enabled"], "next_run": _next_scan_run()})
+
+
+@app.route("/recon/schedule", methods=["POST"])
+@auth.require_perm("scan")
+def save_recon_schedule():
+    f = request.form
+    domain = (f.get("domain") or "").strip()
+    prev = _load_recon_sched()
+    sched = {
+        "enabled": f.get("enabled") == "on",
+        "domain": domain,
+        "frequency": f.get("frequency", "weekly"),
+        "weekday": f.get("weekday", "mon"),
+        "time": f.get("time", "04:00"),
+        "use_amass": f.get("use_amass") == "on",
+        "use_httpx": f.get("use_httpx") == "on",
+        "use_urls": f.get("use_urls") == "on",
+        "last_run": prev.get("last_run"),
+        "last_status": prev.get("last_status"),
+    }
+    _save_recon_sched(sched)
+    _register_recon_sched(sched)
+    _audit("schedule", "Save scheduled recon", detail=f"domain={domain}; enabled={sched['enabled']}")
+    return jsonify({"ok": True, "enabled": sched["enabled"], "next_run": _next_recon_run()})
 
 
 @app.route("/assets")
@@ -1322,6 +1446,95 @@ def findings_clear():
     return jsonify({"ok": True})
 
 
+@app.route("/findings/export")
+@auth.require_perm("scan")
+def findings_export():
+    import csv
+    fmt = request.args.get("fmt", "csv").lower()
+    items = findings_store.list_findings(
+        status=request.args.get("status", "").strip(),
+        severity=request.args.get("severity", "").strip(),
+        target=request.args.get("target", "").strip(),
+        query=request.args.get("q", "").strip(), limit=10000)
+    if fmt == "json":
+        return send_file(io.BytesIO(json.dumps(items, indent=2).encode("utf-8")),
+                         mimetype="application/json", as_attachment=True, download_name="findings.json")
+    cols = ["severity", "title", "owasp", "host", "target", "source", "status",
+            "owner", "first_seen", "last_seen", "count"]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    for e in items:
+        w.writerow([e.get(c, "") for c in cols])
+    return send_file(io.BytesIO(buf.getvalue().encode("utf-8-sig")),
+                     mimetype="text/csv", as_attachment=True, download_name="findings.csv")
+
+
+def _executive_markdown() -> str:
+    now = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    fs = findings_store.stats()
+    items = findings_store.list_findings(limit=5000)
+    owasp = compliance.summarize(items)
+    open_hi = [e for e in items if e.get("status") in ("open", "triaged")
+               and e.get("severity") in ("critical", "high")]
+    targets = monitor.list_targets()
+    parts = ["# Executive Security Report", "", f"_Generated {now} UTC_", "",
+             "## Posture Summary", "",
+             f"- **Findings:** {fs['total']} total · {fs['by_status']['open']} open · "
+             f"{fs['by_status']['fixed']} fixed · {fs['by_status']['accepted']} accepted",
+             f"- **Remediation:** MTTR {fs['mttr_days'] if fs['mttr_days'] is not None else 'n/a'} days "
+             f"· {fs['open_overdue']} open findings older than 30 days",
+             f"- **Monitored targets:** {len(targets)}"]
+    parts += ["", "## Findings by Severity", "", "| Severity | Count |", "|---|---|"]
+    for s in ("critical", "high", "medium", "low", "info"):
+        parts.append(f"| {s.title()} | {fs['by_severity'].get(s, 0)} |")
+    if owasp:
+        parts += ["", "## OWASP Top 10 Coverage", "", "| Category | Findings |", "|---|---|"]
+        for o in owasp:
+            parts.append(f"| {o['title']} | {o['count']} |")
+    parts += ["", "## Open Critical & High Findings", ""]
+    if open_hi:
+        parts += ["| Severity | Finding | Host | First seen | Owner |", "|---|---|---|---|---|"]
+        for e in open_hi[:40]:
+            parts.append(f"| {e['severity'].title()} | {e['title'].replace('|', '/')} "
+                         f"| {e.get('host') or e.get('target')} | {e.get('first_seen', '')[:10]} "
+                         f"| {e.get('owner') or '—'} |")
+    else:
+        parts.append("_None — no open critical or high findings. ✅_")
+    if targets:
+        parts += ["", "## Monitored Targets", "",
+                  "| Type | Target | Last run | Risk | Last change |", "|---|---|---|---|---|"]
+        for t in targets[:30]:
+            risk = t["metrics"].get("risk score", "—")
+            parts.append(f"| {t['kind']} | {t['key']} | {t['ts']} | {risk} | {t['last_change'] or '—'} |")
+    return "\n".join(parts)
+
+
+@app.route("/report/executive")
+@auth.require_perm("scan")
+def executive_report():
+    fmt = request.args.get("fmt", "pdf").lower()
+    md = _executive_markdown()
+    if fmt == "md":
+        return send_file(io.BytesIO(md.encode("utf-8")), mimetype="text/markdown",
+                         as_attachment=True, download_name="executive-report.md")
+    html = report.to_html(md, title="Executive Security Report", heading="Executive Security Report")
+    if fmt == "html":
+        return send_file(io.BytesIO(html.encode("utf-8")), mimetype="text/html",
+                         as_attachment=True, download_name="executive-report.html")
+    try:
+        from xhtml2pdf import pisa
+    except ImportError:
+        abort(501, "PDF export needs xhtml2pdf")
+    buf = io.BytesIO()
+    if pisa.CreatePDF(src=html, dest=buf).err:
+        abort(500, "PDF generation failed")
+    buf.seek(0)
+    _audit("scan", "Generated executive report")
+    return send_file(buf, mimetype="application/pdf", as_attachment=True,
+                     download_name="executive-report.pdf")
+
+
 @app.route("/monitor")
 @auth.require_perm("scan")
 def monitor_view():
@@ -1369,6 +1582,7 @@ def alerts_save():
     f = request.form
     cfg = {
         "enabled": f.get("enabled") == "on",
+        "alert_on_change": f.get("alert_on_change", "on") == "on",
         "min_severity": f.get("min_severity", "high"),
         "email_to": (f.get("email_to") or "").strip(),
         "teams_webhook": (f.get("teams_webhook") or "").strip(),
@@ -1877,7 +2091,7 @@ _PAGE = """<!DOCTYPE html>
   {% if 'scan' in perms %}
   <div class="card">
     <h2>Security trends</h2>
-    <p class="note">Findings by status and severity, plus how each monitored target's risk is trending. <a href="#" class="dash-jump" data-tab="tab-findings">Findings →</a></p>
+    <p class="note">Findings by status and severity, plus how each monitored target's risk is trending. <a href="#" class="dash-jump" data-tab="tab-findings">Findings →</a> · <a href="/report/executive?fmt=pdf" target="_blank">Executive PDF ↓</a></p>
     <div id="dash-trends"><p class="note">Loading…</p></div>
   </div>
   {% endif %}
@@ -2156,8 +2370,11 @@ _PAGE = """<!DOCTYPE html>
       <div><label>Severity</label><select id="findf-severity"><option value="">All severities</option><option>critical</option><option>high</option><option>medium</option><option>low</option><option>info</option></select></div>
       <div><label>Target / host</label><input id="findf-target" placeholder="filter by target"></div>
       <div style="grid-column:span 2"><label>Search</label><input id="findf-q" placeholder="search title / host / source"></div>
-      <div style="display:flex;align-items:flex-end;gap:8px">
+      <div style="display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap">
         <button id="find-refresh" type="button" style="margin:0">Refresh</button>
+        <a class="dl" id="find-csv" href="/findings/export?fmt=csv">CSV</a>
+        <a class="dl" id="find-json" href="/findings/export?fmt=json">JSON</a>
+        <a class="dl" href="/report/executive?fmt=pdf" target="_blank">Executive PDF</a>
         {% if 'delete' in perms %}<button id="find-clear" type="button" class="secondary" style="margin:0">Clear all</button>{% endif %}
       </div>
     </div>
@@ -2223,6 +2440,26 @@ _PAGE = """<!DOCTYPE html>
     </form>
     <div id="rc-console" class="console"></div>
     <div id="rc-actions" style="margin-top:10px"></div>
+  </div>
+  <div class="card">
+    <h2>Scheduled recon</h2>
+    <p class="note">Recurring OSINT recon of a domain for continuous attack-surface monitoring. Change detection compares each run and (if enabled in Settings → Alerts) alerts on new subdomains/exposure. Times are UTC; runs only while the app is running.</p>
+    <form id="recon-sched-form">
+      <div class="check"><input type="checkbox" id="rs-enabled" name="enabled" {% if recon_sched.enabled %}checked{% endif %}><label for="rs-enabled" style="margin:0">Enable scheduled recon</label></div>
+      <div class="grid3" style="margin-top:12px">
+        <div><label>Domain</label><input name="domain" value="{{ recon_sched.domain or '' }}" placeholder="example.com"></div>
+        <div><label>Frequency</label><select name="frequency"><option value="daily" {% if recon_sched.frequency=='daily' %}selected{% endif %}>Daily</option><option value="weekly" {% if recon_sched.frequency not in ['daily','monthly'] %}selected{% endif %}>Weekly</option><option value="monthly" {% if recon_sched.frequency=='monthly' %}selected{% endif %}>Monthly (1st)</option></select></div>
+        <div><label>Time (UTC)</label><input name="time" type="time" value="{{ recon_sched.time or '04:00' }}"></div>
+        <div><label>Day of week (weekly)</label><select name="weekday">{% for d in ['mon','tue','wed','thu','fri','sat','sun'] %}<option value="{{ d }}" {% if recon_sched.weekday==d %}selected{% endif %}>{{ d|capitalize }}</option>{% endfor %}</select></div>
+      </div>
+      <div class="presets" style="margin-top:10px">
+        <label><input type="checkbox" name="use_amass" {% if recon_sched.use_amass %}checked{% endif %}> amass (deeper subdomains)</label>
+        <label><input type="checkbox" name="use_httpx" {% if recon_sched.use_httpx %}checked{% endif %}> httpx live triage</label>
+        <label><input type="checkbox" name="use_urls" {% if recon_sched.use_urls %}checked{% endif %}> historical URLs</label>
+      </div>
+      <button type="submit">Save scheduled recon</button>
+      <span id="rs-state" class="pill">{% if next_recon_run %}Next run: {{ next_recon_run }}{% else %}Not scheduled{% endif %}{% if recon_sched.last_run %} · last: {{ recon_sched.last_run }} ({{ recon_sched.last_status }}){% endif %}</span>
+    </form>
   </div>
   </section>
   {% endif %}
@@ -2445,6 +2682,11 @@ _PAGE = """<!DOCTYPE html>
   {% endif %}
   {% if is_admin %}
   <div class="card">
+    <h2>System health <span id="health-meta" class="pill" style="display:none"></span></h2>
+    <p class="note">Installed scanner tools, configured API keys, scheduled jobs, and data-store sizes. Tools shown as not installed are skipped automatically during scans.</p>
+    <div id="health-body"><p class="note">Loading…</p></div>
+  </div>
+  <div class="card">
     <h2>API keys</h2>
     <p class="note">Store keys here instead of editing <code>.env</code> — they take effect immediately, no restart needed. Includes the LLM engine key (Anthropic/OpenAI) and vendor keys. Stored keys override <code>.env</code>. Leave a field blank to keep the current value; tick Clear to remove it. Keys are write-only (shown masked).</p>
     <form id="keys-form">
@@ -2466,6 +2708,7 @@ _PAGE = """<!DOCTYPE html>
     <p class="note">Notify when a scan's findings meet the severity threshold. Webhook URLs come from Teams/Slack "Incoming Webhook" connectors.</p>
     <form id="alerts-form">
       <div class="check"><input type="checkbox" id="al-en" name="enabled" {% if alert_cfg.enabled %}checked{% endif %}><label for="al-en" style="margin:0">Enable alerts</label></div>
+      <div class="check"><input type="checkbox" id="al-change" name="alert_on_change" {% if alert_cfg.get('alert_on_change', True) %}checked{% endif %}><label for="al-change" style="margin:0">Alert on new exposure (change detection — new ports/subdomains or risk increase)</label></div>
       <div class="grid3" style="margin-top:12px">
         <div><label>Trigger at severity</label><select name="min_severity">{% for s in ['critical','high','medium','low'] %}<option value="{{ s }}" {% if alert_cfg.min_severity==s %}selected{% endif %}>{{ s|capitalize }} and above</option>{% endfor %}</select></div>
         <div><label>Email to (comma-separated)</label><input name="email_to" value="{{ alert_cfg.email_to or '' }}"></div>
@@ -3011,6 +3254,12 @@ async function loadTrends() {
       '<div style="width:' + Math.round(100*n/maxSev) + '%;height:100%;background:' + SEV[sv] + '"></div></div>' +
       '<span style="width:28px;text-align:right;font-size:12px">' + n + '</span></div>';
   });
+  if (f.mttr_days != null || f.open_overdue) {
+    h += '<div class="note" style="margin:8px 0"><b>Remediation:</b> ' +
+      (f.mttr_days != null ? 'MTTR ' + f.mttr_days + ' days' : 'MTTR n/a') +
+      ' · ' + (f.open_overdue || 0) + ' open >30 days' +
+      (f.aging ? ' · aging ' + ['<7d','7-30d','30-90d','>90d'].map(b => b + ':' + (f.aging[b]||0)).join(' ') : '') + '</div>';
+  }
   const series = d.risk_series || {};
   const keys = Object.keys(series);
   if (keys.length) {
@@ -3338,6 +3587,16 @@ if (ssForm) ssForm.addEventListener('submit', async (e) => {
   else { s.textContent = d.message || 'error'; s.className = 'pill err'; }
 });
 
+// scheduled recon
+const rsForm = document.getElementById('recon-sched-form');
+if (rsForm) rsForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const d = await (await fetch('/recon/schedule', { method:'POST', body: new FormData(rsForm) })).json();
+  const s = document.getElementById('rs-state');
+  if (d.ok) { s.textContent = (d.enabled && d.next_run) ? ('Saved · next run: ' + d.next_run) : 'Scheduled recon disabled'; s.className = 'pill ok'; }
+  else { s.textContent = d.message || 'error'; s.className = 'pill err'; }
+});
+
 // asset inventory clear
 const assetsClear = document.getElementById('assets-clear');
 if (assetsClear) assetsClear.addEventListener('click', async () => {
@@ -3359,6 +3618,9 @@ if (findingsTable) {
   async function loadFindings() {
     findingsTable.innerHTML = '<p class="note">Loading…</p>';
     const qs = new URLSearchParams({ status:fs.value, severity:fsev.value, target:ft.value, q:fq.value });
+    const csvL = document.getElementById('find-csv'), jsonL = document.getElementById('find-json');
+    if (csvL) csvL.href = '/findings/export?fmt=csv&' + qs;
+    if (jsonL) jsonL.href = '/findings/export?fmt=json&' + qs;
     let d;
     try { d = await (await fetch('/findings?' + qs)).json(); }
     catch (e) { findingsTable.innerHTML = '<p class="err">Couldn\\'t load findings.</p>'; return; }
@@ -3366,7 +3628,10 @@ if (findingsTable) {
     if (!filled) { statuses.forEach(s => fs.insertAdjacentHTML('beforeend', '<option value="'+s+'">'+s+'</option>')); filled = true; }
     const st = d.stats || {by_status:{}};
     meta.style.display='inline';
-    meta.textContent = (st.total||0) + ' total · ' + (st.by_status.open||0) + ' open · ' + (st.by_status.fixed||0) + ' fixed';
+    let metaTxt = (st.total||0) + ' total · ' + (st.by_status.open||0) + ' open · ' + (st.by_status.fixed||0) + ' fixed';
+    if (st.mttr_days != null) metaTxt += ' · MTTR ' + st.mttr_days + 'd';
+    if (st.open_overdue) metaTxt += ' · ' + st.open_overdue + ' overdue (>30d)';
+    meta.textContent = metaTxt;
     const ev = d.findings || [];
     if (!ev.length) { findingsTable.innerHTML = '<p class="note">No findings yet — run a network scan, or adjust filters.</p>'; return; }
     let owaspBar = '';
@@ -3483,6 +3748,33 @@ if (keysForm) keysForm.addEventListener('submit', async (e) => {
   s.style.display = 'inline'; s.textContent = 'Saved'; s.className = 'pill ok';
   setTimeout(() => location.reload(), 700);
 });
+
+// System health
+const healthBody = document.getElementById('health-body');
+if (healthBody) {
+  const kb = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1) + ' KB' : (n/1048576).toFixed(1) + ' MB';
+  const dot = (ok) => '<span style="color:' + (ok ? '#4ade80' : '#64748b') + '">' + (ok ? '●' : '○') + '</span>';
+  (async () => {
+    let d;
+    try { d = await (await fetch('/api/health')).json(); }
+    catch (e) { healthBody.innerHTML = '<p class="err">Couldn\\'t load health.</p>'; return; }
+    const tools = d.tools || {}, keys = d.keys || [], jobs = d.jobs || [], data = d.data_bytes || {};
+    const okTools = Object.values(tools).filter(Boolean).length;
+    document.getElementById('health-meta').style.display = 'inline';
+    document.getElementById('health-meta').textContent = okTools + '/' + Object.keys(tools).length + ' tools · ' + jobs.length + ' job(s)';
+    let h = '<div class="grid3" style="gap:14px">';
+    h += '<div><b style="font-size:13px">Scanner tools</b><div style="font-size:12px;line-height:1.9;margin-top:4px">' +
+      Object.keys(tools).sort().map(t => dot(tools[t]) + ' ' + t).join('<br>') + '</div></div>';
+    h += '<div><b style="font-size:13px">API keys</b><div style="font-size:12px;line-height:1.9;margin-top:4px">' +
+      keys.map(k => dot(k.configured) + ' ' + k.label).join('<br>') + '</div></div>';
+    h += '<div><b style="font-size:13px">Scheduled jobs</b><div style="font-size:12px;line-height:1.9;margin-top:4px">' +
+      (jobs.length ? jobs.map(j => '● ' + j.id + (j.next_run ? ' → ' + j.next_run : '')).join('<br>') : '<span class="note" style="margin:0">none scheduled</span>') +
+      '</div><b style="font-size:13px;display:block;margin-top:10px">Data stores</b><div style="font-size:12px;line-height:1.9;margin-top:4px">' +
+      Object.entries(data).map(([k,v]) => k + ': ' + kb(v)).join('<br>') + '</div></div>';
+    h += '</div><div class="note" style="margin-top:10px">Engine: ' + (d.provider || '—') + '</div>';
+    healthBody.innerHTML = h;
+  })();
+}
 
 // alerts config
 const alForm = document.getElementById('alerts-form');
@@ -3644,6 +3936,9 @@ def _startup():
     scan_sched = _load_scan_sched()
     if scan_sched:
         _register_scan_sched(scan_sched)
+    recon_sched = _load_recon_sched()
+    if recon_sched:
+        _register_recon_sched(recon_sched)
 
 
 if __name__ == "__main__":

@@ -114,6 +114,7 @@ ENV DATA_DIR=/app/data \
     FLASK_SECRET_FILE=/app/data/.flask_secret \
     SCHEDULE_FILE=/app/data/schedule.json \
     SCAN_SCHED_FILE=/app/data/scan_schedule.json \
+    RECON_SCHED_FILE=/app/data/recon_schedule.json \
     SCAN_STATS_FILE=/app/data/scan_stats.json \
     ASSETS_FILE=/app/data/assets.json \
     ALERTS_FILE=/app/data/alerts.json \
